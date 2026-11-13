@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+import curses
+import os
+import subprocess
+import time
+
+PORTAL_PKGS = [
+    "xdg-desktop-portal",
+    "xdg-desktop-portal-hyprland",
+    "xdg-desktop-portal-gtk",
+    "xdg-desktop-portal-gnome",
+]
+
+USER_UNITS = [
+    "xdg-desktop-portal",
+    "xdg-desktop-portal-hyprland",
+    "xdg-desktop-portal-gtk",
+    "pipewire",
+    "pipewire-pulse",
+    "wireplumber",
+]
+
+
+def run_cmd(args: list[str], timeout: int = 5) -> tuple[int, str, str]:
+    try:
+        res = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def get_pkg_status() -> dict[str, str]:
+    status = {}
+    for pkg in PORTAL_PKGS:
+        rc, out, _ = run_cmd(["pacman", "-Q", pkg])
+        status[pkg] = out.split()[1] if rc == 0 and len(out.split()) >= 2 else "MISSING"
+    return status
+
+
+def get_service_status() -> dict[str, str]:
+    status = {}
+    for unit in USER_UNITS:
+        rc, out, err = run_cmd(["systemctl", "--user", "is-active", unit])
+        val = (out or err).splitlines()
+        status[unit] = val[0].strip() if val else "unknown"
+    return status
+
+
+def get_dbus_and_env() -> dict:
+    _, env_out, _ = run_cmd(["systemctl", "--user", "show-environment"])
+    env_map = {}
+    for line in env_out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            if k in ("WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "HYPRLAND_INSTANCE_SIGNATURE"):
+                env_map[k] = v
+
+    _, bus_out, _ = run_cmd(["busctl", "--user", "list"])
+    impls = []
+    for line in bus_out.splitlines():
+        parts = line.split()
+        if parts and parts[0].startswith("org.freedesktop.impl.portal.desktop."):
+            impls.append(parts[0].split(".")[-1])
+
+    user_conf = os.path.expanduser("~/.config/xdg-desktop-portal/hyprland-portals.conf")
+    sys_conf = "/usr/share/xdg-desktop-portal/hyprland-portals.conf"
+    if os.path.exists(user_conf):
+        route_cfg = "~/.config/xdg-desktop-portal/hyprland-portals.conf (Pinned)"
+    elif os.path.exists(sys_conf):
+        route_cfg = "/usr/share/xdg-desktop-portal/hyprland-portals.conf (System)"
+    else:
+        route_cfg = "MISSING"
+
+    return {
+        "wayland": env_map.get("WAYLAND_DISPLAY", "UNSET"),
+        "desktop": env_map.get("XDG_CURRENT_DESKTOP", "UNSET"),
+        "impls": sorted(set(impls)),
+        "route_cfg": route_cfg,
+    }
+
+
+def get_pipewire_summary() -> dict:
+    rc, out, _ = run_cmd(["wpctl", "status"])
+    if rc != 0:
+        return {"sink": "N/A", "source": "N/A", "video_nodes": 0}
+
+    default_sink = "None"
+    default_source = "None"
+    in_sinks = False
+    in_sources = False
+    in_video = False
+    video_lines = 0
+
+    for raw in out.splitlines():
+        line = raw.strip()
+        if line.startswith("├─ Sinks:") or line.startswith("└─ Sinks:"):
+            in_sinks, in_sources = True, False
+            continue
+        elif line.startswith("├─ Sources:") or line.startswith("└─ Sources:"):
+            in_sinks, in_sources = False, True
+            continue
+        elif line.startswith("├─ Filters:") or line.startswith("├─ Streams:") or line.startswith("Video"):
+            in_sinks, in_sources = False, False
+            if line == "Video":
+                in_video = True
+            continue
+        elif line == "Settings":
+            in_video = False
+            continue
+
+        if in_sinks and "*" in line:
+            default_sink = line.split(".", 1)[-1].strip()
+        elif in_sources and "*" in line:
+            default_source = line.split(".", 1)[-1].strip()
+        elif in_video and any(ch.isdigit() for ch in line):
+            video_lines += 1
+
+    return {
+        "sink": default_sink,
+        "source": default_source,
+        "video_nodes": video_lines,
+    }
+
+
+def run_interactive_cmd(stdscr, cmd: list[str], banner: str) -> int:
+    curses.def_prog_mode()
+    curses.endwin()
+    print(f"\n[portal-mgr] {banner}\n")
+    proc = subprocess.run(cmd)
+    curses.reset_prog_mode()
+    stdscr.refresh()
+    return proc.returncode
+
+
+def auto_configure_portals(stdscr) -> str:
+    pkg_check = get_pkg_status()
+    if pkg_check.get("xdg-desktop-portal-hyprland") == "MISSING":
+        rc = run_interactive_cmd(
+            stdscr,
+            ["sudo", "pacman", "-S", "--needed", "xdg-desktop-portal-hyprland"],
+            "Installing xdg-desktop-portal-hyprland...",
+        )
+        if rc != 0:
+            return "ERROR: pacman failed to install xdg-desktop-portal-hyprland."
+
+    conf_dir = os.path.expanduser("~/.config/xdg-desktop-portal")
+    os.makedirs(conf_dir, exist_ok=True)
+    conf_path = os.path.join(conf_dir, "hyprland-portals.conf")
+    with open(conf_path, "w", encoding="utf-8") as f:
+        f.write(
+            "[preferred]\n"
+            "default=hyprland;gtk\n"
+            "org.freedesktop.impl.portal.ScreenCast=hyprland\n"
+            "org.freedesktop.impl.portal.Screenshot=hyprland\n"
+            "org.freedesktop.impl.portal.FileChooser=gtk\n"
+        )
+
+    run_cmd([
+        "dbus-update-activation-environment",
+        "--systemd",
+        "WAYLAND_DISPLAY",
+        "XDG_CURRENT_DESKTOP",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+    ])
+    run_cmd(["systemctl", "--user", "stop", "xdg-desktop-portal-gnome"])
+    rc, _, err = run_cmd([
+        "systemctl",
+        "--user",
+        "restart",
+        "xdg-desktop-portal-hyprland",
+        "xdg-desktop-portal-gtk",
+        "xdg-desktop-portal",
+    ], timeout=10)
+    if rc != 0:
+        return f"ERROR: Failed restarting portal services: {err}"
+
+    time.sleep(0.5)
+    return "OK: portal-hyprland installed, hyprland-portals.conf pinned, D-Bus env synced."
+
+
+def test_screencast_and_screenshot() -> str:
+    rc1, out1, err1 = run_cmd([
+        "gdbus", "call", "--session",
+        "--dest", "org.freedesktop.portal.Desktop",
+        "--object-path", "/org/freedesktop/portal/desktop",
+        "--method", "org.freedesktop.portal.ScreenCast.CreateSession",
+        "{'session_handle_token': <'portal_mgr_test'>}",
+    ], timeout=8)
+    if rc1 != 0 or "/org/freedesktop/portal/desktop/request/" not in out1:
+        return f"FAIL (ScreenCast): {err1 or out1}"
+
+    rc2, out2, err2 = run_cmd([
+        "gdbus", "call", "--session",
+        "--dest", "org.freedesktop.portal.Desktop",
+        "--object-path", "/org/freedesktop/portal/desktop",
+        "--method", "org.freedesktop.portal.Screenshot.Screenshot",
+        "", "{}",
+    ], timeout=8)
+    if rc2 != 0 or "/org/freedesktop/portal/desktop/request/" not in out2:
+        return f"FAIL (Screenshot): {err2 or out2}"
+
+    return "PASS: ScreenCast + Hyprland Screenshot portals responded (check capture overlay)."
+
+
+def test_file_chooser() -> str:
+    rc, out, err = run_cmd([
+        "gdbus", "call", "--session",
+        "--dest", "org.freedesktop.portal.Desktop",
+        "--object-path", "/org/freedesktop/portal/desktop",
+        "--method", "org.freedesktop.portal.FileChooser.OpenFile",
+        "", "Portal File Picker Test", "{}",
+    ], timeout=8)
+    if rc != 0 or "/org/freedesktop/portal/desktop/request/" not in out:
+        return f"FAIL (FileChooser): {err or out}"
+    return "PASS: GTK FileChooser portal responded (check file dialog window)."
+
+
+def restart_stack() -> str:
+    run_cmd(["systemctl", "--user", "stop", "xdg-desktop-portal-gnome"])
+    rc, _, err = run_cmd([
+        "systemctl",
+        "--user",
+        "restart",
+        "xdg-desktop-portal-hyprland",
+        "xdg-desktop-portal-gtk",
+        "xdg-desktop-portal",
+    ], timeout=10)
+    if rc != 0:
+        return f"ERROR: Restart failed: {err}"
+    return "OK: Restarted portal-hyprland, portal-gtk, and xdg-desktop-portal."
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    try:
+        win.addstr(y, x, text[: max_x - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)
+
+    status_msg = "Ready. Press [1] to Install & Wire Portals, [2] Test ScreenCast/Shot, [3] Test File Picker."
+    pkgs = get_pkg_status()
+    svcs = get_service_status()
+    dbus_env = get_dbus_and_env()
+    pw = get_pipewire_summary()
+    last_poll = time.time()
+
+    def refresh_all() -> None:
+        nonlocal pkgs, svcs, dbus_env, pw, last_poll
+        pkgs = get_pkg_status()
+        svcs = get_service_status()
+        dbus_env = get_dbus_and_env()
+        pw = get_pipewire_summary()
+        last_poll = time.time()
+
+    while True:
+        if time.time() - last_poll >= 2.5:
+            refresh_all()
+
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        c_ok = curses.color_pair(2) | curses.A_BOLD
+        c_warn = curses.color_pair(3) | curses.A_BOLD
+        c_err = curses.color_pair(4) | curses.A_BOLD
+
+        safe_addstr(stdscr, 1, 2, "razorbillOS // XDG Desktop Portal & PipeWire Manager (Hyprland)", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 74, curses.color_pair(1))
+
+        # Packages
+        safe_addstr(stdscr, 4, 2, "[ PORTAL PACKAGES ]", c_title)
+        y = 5
+        for pkg in PORTAL_PKGS:
+            ver = pkgs.get(pkg, "MISSING")
+            if pkg == "xdg-desktop-portal-gnome":
+                col = c_warn if ver != "MISSING" else c_ok
+                note = " (installed via GDM - must not hijack)" if ver != "MISSING" else ""
+            else:
+                col = c_ok if ver != "MISSING" else c_err
+                note = ""
+            safe_addstr(stdscr, y, 4, f"{pkg:<30}: {ver}{note}", col)
+            y += 1
+
+        # Services
+        safe_addstr(stdscr, 10, 2, "[ USER SYSTEMD SERVICES ]", c_title)
+        y = 11
+        for unit in USER_UNITS:
+            st = svcs.get(unit, "unknown")
+            col = c_ok if st == "active" else c_err
+            safe_addstr(stdscr, y, 4, f"{unit:<30}: {st}", col)
+            y += 1
+
+        # D-Bus & Routing
+        safe_addstr(stdscr, 18, 2, "[ D-BUS SESSION & PORTAL ROUTING ]", c_title)
+        env_ok = dbus_env["wayland"] != "UNSET" and dbus_env["desktop"] == "Hyprland"
+        safe_addstr(
+            stdscr,
+            19,
+            4,
+            f"Session Env       : WAYLAND_DISPLAY={dbus_env['wayland']} | XDG_CURRENT_DESKTOP={dbus_env['desktop']}",
+            c_ok if env_ok else c_err,
+        )
+        impls_str = ", ".join(dbus_env["impls"]) if dbus_env["impls"] else "None"
+        impl_ok = "hyprland" in dbus_env["impls"] and "gnome" not in dbus_env["impls"]
+        safe_addstr(
+            stdscr,
+            20,
+            4,
+            f"Active Backends   : {impls_str}",
+            c_ok if impl_ok else c_warn,
+        )
+        safe_addstr(stdscr, 21, 4, f"Routing Config    : {dbus_env['route_cfg']}")
+
+        # PipeWire
+        safe_addstr(stdscr, 23, 2, "[ PIPEWIRE MEDIA ROUTING ]", c_title)
+        safe_addstr(stdscr, 24, 4, f"Default Sink      : {pw['sink']}")
+        safe_addstr(stdscr, 25, 4, f"Default Source    : {pw['source']}")
+
+        # Actions
+        safe_addstr(stdscr, 27, 2, "[ ACTIONS ]", c_title)
+        safe_addstr(stdscr, 28, 4, "[1] Auto-Install portal-hyprland + Pin hyprland-portals.conf + Sync D-Bus")
+        safe_addstr(stdscr, 29, 4, "[2] Test ScreenCast (PipeWire) & Hyprland Screenshot Portal")
+        safe_addstr(stdscr, 30, 4, "[3] Test GTK FileChooser Portal (Browser / VS Code File Dialog)")
+        safe_addstr(stdscr, 31, 4, "[4] Restart Portal Stack   [r] Refresh   [q] Quit")
+
+        safe_addstr(stdscr, 33, 2, "-" * 74, curses.color_pair(1))
+        msg_col = c_err if status_msg.startswith(("ERROR", "FAIL")) else (c_ok if status_msg.startswith(("OK", "PASS")) else c_warn)
+        safe_addstr(stdscr, 34, 2, f"Status: {status_msg}", msg_col)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        elif ch in (ord("q"), ord("Q")):
+            break
+        elif ch == ord("1"):
+            status_msg = auto_configure_portals(stdscr)
+            refresh_all()
+        elif ch == ord("2"):
+            status_msg = test_screencast_and_screenshot()
+            refresh_all()
+        elif ch == ord("3"):
+            status_msg = test_file_chooser()
+            refresh_all()
+        elif ch == ord("4"):
+            status_msg = restart_stack()
+            refresh_all()
+        elif ch in (ord("r"), ord("R")):
+            refresh_all()
+            status_msg = "Refreshed portal & PipeWire status."
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

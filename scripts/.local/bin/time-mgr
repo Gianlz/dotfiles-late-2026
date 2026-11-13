@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+import curses
+import os
+import re
+import subprocess
+import time
+
+TARGET_TZ = "America/Sao_Paulo"
+
+
+def run_cmd(args: list[str], timeout: int = 5) -> tuple[int, str, str]:
+    try:
+        res = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def get_timedate_info() -> dict:
+    rc, out, _ = run_cmd(["timedatectl", "show"])
+    props = {}
+    if rc == 0:
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                props[k.strip()] = v.strip()
+
+    # Check active NTP daemon
+    daemon = "inactive"
+    for svc in ("systemd-timesyncd", "chronyd", "ntpd"):
+        r_svc, s_out, _ = run_cmd(["systemctl", "is-active", svc])
+        if r_svc == 0 and s_out.strip() == "active":
+            daemon = f"{svc} (active)"
+            break
+
+    # Check upstream NTP server & offset
+    server = "Pending / None"
+    offset = "N/A"
+    stratum = "-"
+    rc_ts, ts_out, _ = run_cmd(["timedatectl", "timesync-status"])
+    if rc_ts == 0:
+        for line in ts_out.splitlines():
+            s = line.strip()
+            if s.startswith("Server:"):
+                server = s.split(":", 1)[1].strip()
+            elif s.startswith("Offset:"):
+                offset = s.split(":", 1)[1].strip()
+            elif s.startswith("Stratum:"):
+                stratum = s.split(":", 1)[1].strip()
+
+    return {
+        "timezone": props.get("Timezone", "Unknown"),
+        "local_rtc": props.get("LocalRTC", "unknown"),
+        "ntp_enabled": props.get("NTP", "unknown"),
+        "ntp_synced": props.get("NTPSynchronized", "unknown"),
+        "local_time": props.get("TimeUSec", "Unknown"),
+        "rtc_time": props.get("RTCTimeUSec", "Unknown"),
+        "daemon": daemon,
+        "server": server,
+        "offset": offset,
+        "stratum": stratum,
+    }
+
+
+def get_locale_info() -> dict:
+    locale_conf = {}
+    if os.path.exists("/etc/locale.conf"):
+        with open("/etc/locale.conf", "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k, v = s.split("=", 1)
+                    locale_conf[k.strip()] = v.strip().strip('"').strip("'")
+
+    rc_la, la_out, _ = run_cmd(["locale", "-a"])
+    avail = [l.strip() for l in la_out.splitlines() if l.strip()] if rc_la == 0 else []
+    has_en = any(l.lower() in ("en_us.utf8", "en_us.utf-8") for l in avail)
+    has_pt = any(l.lower() in ("pt_br.utf8", "pt_br.utf-8") for l in avail)
+
+    keymap = "unset"
+    rc_lc, lc_out, _ = run_cmd(["localectl", "status"])
+    if rc_lc == 0:
+        for line in lc_out.splitlines():
+            s = line.strip()
+            if s.startswith("VC Keymap:"):
+                keymap = s.split(":", 1)[1].strip()
+
+    return {
+        "conf": locale_conf,
+        "has_en": has_en,
+        "has_pt": has_pt,
+        "count": len(avail),
+        "keymap": keymap,
+    }
+
+
+def run_interactive_cmd(stdscr, cmd: list[str], banner: str) -> int:
+    curses.def_prog_mode()
+    curses.endwin()
+    print(f"\n[time-mgr] {banner}\n")
+    proc = subprocess.run(cmd)
+    curses.reset_prog_mode()
+    stdscr.refresh()
+    return proc.returncode
+
+
+def action_configure_time_and_ntp(stdscr) -> str:
+    script = (
+        f"timedatectl set-timezone {TARGET_TZ} && "
+        "timedatectl set-local-rtc 0 && "
+        "timedatectl set-ntp true && "
+        "systemctl enable --now systemd-timesyncd"
+    )
+    rc = run_interactive_cmd(
+        stdscr,
+        ["sudo", "bash", "-c", script],
+        f"Setting timezone to {TARGET_TZ}, RTC to UTC, and enabling NTP...",
+    )
+    if rc != 0:
+        return "ERROR: Failed updating timezone or NTP settings."
+    time.sleep(0.5)
+    return f"OK: Timezone={TARGET_TZ}, RTC=UTC, NTP enabled & synced."
+
+
+def ensure_locales_generated(stdscr) -> bool:
+    py_patch = (
+        "p='/etc/locale.gen'; "
+        "t=open(p).read(); "
+        "import re; "
+        "t=re.sub(r'^#\\s*(en_US\\.UTF-8 UTF-8)', r'\\1', t, flags=re.M); "
+        "t=re.sub(r'^#\\s*(pt_BR\\.UTF-8 UTF-8)', r'\\1', t, flags=re.M); "
+        "open(p,'w').write(t)"
+    )
+    cmd = f'python3 -c "{py_patch}" && locale-gen'
+    rc = run_interactive_cmd(
+        stdscr,
+        ["sudo", "bash", "-c", cmd],
+        "Enabling en_US.UTF-8 & pt_BR.UTF-8 in /etc/locale.gen and running locale-gen...",
+    )
+    return rc == 0
+
+
+def action_set_pure_en_locale(stdscr) -> str:
+    if not ensure_locales_generated(stdscr):
+        return "ERROR: locale-gen failed."
+    rc = run_interactive_cmd(
+        stdscr,
+        ["sudo", "localectl", "set-locale", "LANG=en_US.UTF-8"],
+        "Setting /etc/locale.conf to pure en_US.UTF-8...",
+    )
+    if rc != 0:
+        return "ERROR: localectl set-locale failed."
+    return "OK: Generated en_US + pt_BR UTF-8; active LANG=en_US.UTF-8."
+
+
+def action_set_hybrid_locale(stdscr) -> str:
+    if not ensure_locales_generated(stdscr):
+        return "ERROR: locale-gen failed."
+    rc = run_interactive_cmd(
+        stdscr,
+        [
+            "sudo",
+            "localectl",
+            "set-locale",
+            "LANG=en_US.UTF-8",
+            "LC_TIME=pt_BR.UTF-8",
+            "LC_MONETARY=pt_BR.UTF-8",
+            "LC_MEASUREMENT=pt_BR.UTF-8",
+        ],
+        "Setting hybrid locale (English UI + pt_BR time/currency/metric)...",
+    )
+    if rc != 0:
+        return "ERROR: localectl hybrid set-locale failed."
+    return "OK: Hybrid locale set (LANG=en_US.UTF-8 + pt_BR formatting)."
+
+
+def action_force_ntp_resync(stdscr) -> str:
+    rc = run_interactive_cmd(
+        stdscr,
+        ["sudo", "systemctl", "restart", "systemd-timesyncd"],
+        "Restarting systemd-timesyncd to force immediate NTP sync...",
+    )
+    if rc != 0:
+        return "ERROR: Failed restarting systemd-timesyncd."
+    time.sleep(1.2)
+    info = get_timedate_info()
+    if info["ntp_synced"] == "yes":
+        return f"PASS: Clock synchronized with {info['server']} (Offset: {info['offset']})."
+    return "WARN: Daemon restarted; NTP handshake still in progress (press [r] in 2s)."
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    try:
+        win.addstr(y, x, text[: max_x - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)
+
+    status_msg = "Ready. Press [1] Configure Timezone/NTP, [2] Set en_US Locale, [4] Force NTP Sync."
+    td = get_timedate_info()
+    loc = get_locale_info()
+    last_poll = time.time()
+
+    def refresh_all() -> None:
+        nonlocal td, loc, last_poll
+        td = get_timedate_info()
+        loc = get_locale_info()
+        last_poll = time.time()
+
+    while True:
+        if time.time() - last_poll >= 1.0:
+            refresh_all()
+
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        c_ok = curses.color_pair(2) | curses.A_BOLD
+        c_warn = curses.color_pair(3) | curses.A_BOLD
+        c_err = curses.color_pair(4) | curses.A_BOLD
+
+        safe_addstr(stdscr, 1, 2, "razorbillOS // Timezone, Locale & NTP Manager (CachyOS)", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 76, curses.color_pair(1))
+
+        # Section 1: Timezone & RTC
+        safe_addstr(stdscr, 4, 2, "[ TIMEZONE & HARDWARE CLOCK (RTC) ]", c_title)
+        safe_addstr(stdscr, 5, 4, f"Local Time        : {td['local_time']}")
+        safe_addstr(stdscr, 6, 4, f"Hardware RTC Time : {td['rtc_time']}")
+        tz_ok = td["timezone"] == TARGET_TZ
+        safe_addstr(
+            stdscr,
+            7,
+            4,
+            f"Active Timezone   : {td['timezone']} (Target: {TARGET_TZ})",
+            c_ok if tz_ok else c_warn,
+        )
+        rtc_ok = td["local_rtc"] == "no"
+        rtc_label = "UTC (Recommended)" if rtc_ok else "LOCAL TZ (Causes clock drift)"
+        safe_addstr(
+            stdscr,
+            8,
+            4,
+            f"RTC in Local TZ   : {td['local_rtc']} -> {rtc_label}",
+            c_ok if rtc_ok else c_err,
+        )
+
+        # Section 2: NTP
+        safe_addstr(stdscr, 10, 2, "[ NTP SYNCHRONIZATION ]", c_title)
+        ntp_ok = td["ntp_enabled"] == "yes" and td["ntp_synced"] == "yes"
+        safe_addstr(
+            stdscr,
+            11,
+            4,
+            f"NTP Enabled/Synced: enabled={td['ntp_enabled']} | synchronized={td['ntp_synced']}",
+            c_ok if ntp_ok else c_err,
+        )
+        safe_addstr(
+            stdscr,
+            12,
+            4,
+            f"Time Sync Daemon  : {td['daemon']}",
+            c_ok if "active" in td["daemon"] else c_err,
+        )
+        safe_addstr(
+            stdscr,
+            13,
+            4,
+            f"Upstream Server   : {td['server']} (Stratum {td['stratum']} | Offset: {td['offset']})",
+        )
+
+        # Section 3: Locale
+        safe_addstr(stdscr, 15, 2, "[ SYSTEM LOCALE & KEYMAP ]", c_title)
+        conf_items = [f"{k}={v}" for k, v in loc["conf"].items()]
+        conf_str = " ".join(conf_items) if conf_items else "UNSET (/etc/locale.conf missing)"
+        safe_addstr(
+            stdscr,
+            16,
+            4,
+            f"Active locale.conf: {conf_str}",
+            c_ok if loc["conf"].get("LANG") else c_err,
+        )
+        gen_str = (
+            f"en_US.UTF-8: {'YES' if loc['has_en'] else 'NO'}  |  "
+            f"pt_BR.UTF-8: {'YES' if loc['has_pt'] else 'NO'}  (Total compiled: {loc['count']})"
+        )
+        safe_addstr(
+            stdscr,
+            17,
+            4,
+            f"Generated Locales : {gen_str}",
+            c_ok if (loc["has_en"] and loc["has_pt"]) else c_warn,
+        )
+        safe_addstr(stdscr, 18, 4, f"Console Keymap    : {loc['keymap']}")
+
+        # Section 4: Actions
+        safe_addstr(stdscr, 20, 2, "[ ACTIONS ]", c_title)
+        safe_addstr(stdscr, 21, 4, f"[1] Enforce {TARGET_TZ} + UTC Hardware Clock + Enable NTP")
+        safe_addstr(stdscr, 22, 4, "[2] Generate en_US & pt_BR UTF-8 + Set Pure English (LANG=en_US.UTF-8)")
+        safe_addstr(stdscr, 23, 4, "[3] Set Hybrid Locale (English UI + pt_BR Time/Currency/Metric)")
+        safe_addstr(stdscr, 24, 4, "[4] Force Immediate NTP Resync   [r] Refresh   [q] Quit")
+
+        safe_addstr(stdscr, 26, 2, "-" * 76, curses.color_pair(1))
+        msg_col = (
+            c_err
+            if status_msg.startswith("ERROR")
+            else (c_ok if status_msg.startswith(("OK", "PASS")) else c_warn)
+        )
+        safe_addstr(stdscr, 27, 2, f"Status: {status_msg}", msg_col)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        elif ch in (ord("q"), ord("Q")):
+            break
+        elif ch == ord("1"):
+            status_msg = action_configure_time_and_ntp(stdscr)
+            refresh_all()
+        elif ch == ord("2"):
+            status_msg = action_set_pure_en_locale(stdscr)
+            refresh_all()
+        elif ch == ord("3"):
+            status_msg = action_set_hybrid_locale(stdscr)
+            refresh_all()
+        elif ch == ord("4"):
+            status_msg = action_force_ntp_resync(stdscr)
+            refresh_all()
+        elif ch in (ord("r"), ord("R")):
+            refresh_all()
+            status_msg = "Refreshed timezone, NTP, and locale state."
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

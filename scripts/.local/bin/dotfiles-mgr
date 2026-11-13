@@ -1,0 +1,788 @@
+#!/usr/bin/env python3
+import curses
+import glob
+import os
+import re
+import shutil
+import subprocess
+import time
+
+HOME = os.path.expanduser("~")
+BARE_DIR = os.path.join(HOME, ".dotfiles")
+STOW_DIR = os.path.join(HOME, "dotfiles")
+ZSHRC_PATH = os.path.join(HOME, ".zshrc")
+SSH_PUB = os.path.join(HOME, ".ssh", "id_ed25519.pub")
+
+
+def run_cmd(args: list[str], timeout: int = 8) -> tuple[int, str, str]:
+    try:
+        res = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def bare_git(*args: str, timeout: int = 8) -> tuple[int, str, str]:
+    return run_cmd(
+        ["git", f"--git-dir={BARE_DIR}", f"--work-tree={HOME}", *args],
+        timeout=timeout,
+    )
+
+
+def stow_git(*args: str, timeout: int = 8) -> tuple[int, str, str]:
+    return run_cmd(["git", "-C", STOW_DIR, *args], timeout=timeout)
+
+
+def is_bare_ready() -> bool:
+    return os.path.isdir(BARE_DIR) and os.path.isfile(os.path.join(BARE_DIR, "HEAD"))
+
+
+def is_stow_ready() -> bool:
+    return os.path.isdir(os.path.join(STOW_DIR, ".git"))
+
+
+def get_repo_metrics(mode: str) -> dict:
+    fn = bare_git if mode == "bare" else stow_git
+
+    rc_b, branch, _ = fn("symbolic-ref", "--short", "HEAD")
+    branch = branch if rc_b == 0 and branch else "main (unborn)"
+
+    rc_c, cnt_out, _ = fn("rev-list", "--count", "HEAD")
+    commits = int(cnt_out) if rc_c == 0 and cnt_out.isdigit() else 0
+
+    rc_r, remote, _ = fn("remote", "get-url", "origin")
+    remote = remote if rc_r == 0 and remote else "UNSET"
+
+    rc_u, up_out, _ = fn("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    upstream = up_out if rc_u == 0 and up_out else "untracked"
+
+    ahead, behind = 0, 0
+    if rc_u == 0 and commits > 0:
+        rc_ab, ab_out, _ = fn("rev-list", "--left-right", "--count", "HEAD...@{u}")
+        if rc_ab == 0 and len(ab_out.split()) == 2:
+            a_s, b_s = ab_out.split()
+            ahead, behind = int(a_s), int(b_s)
+
+    rc_s, st_out, _ = fn("status", "--porcelain")
+    dirty = len([l for l in st_out.splitlines() if l.strip()]) if rc_s == 0 else 0
+
+    rc_f, ls_out, _ = fn("ls-files")
+    tracked = len([l for l in ls_out.splitlines() if l.strip()]) if rc_f == 0 else 0
+
+    return {
+        "branch": branch,
+        "commits": commits,
+        "remote": remote,
+        "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
+        "dirty": dirty,
+        "tracked": tracked,
+    }
+
+
+def check_target_coverage() -> list[tuple[str, str]]:
+    bare_files = set()
+    if is_bare_ready():
+        rc, out, _ = bare_git("ls-files")
+        if rc == 0:
+            bare_files = set(out.splitlines())
+
+    items = [
+        ("~/.config/hypr", os.path.join(HOME, ".config", "hypr")),
+        ("~/.zshrc", ZSHRC_PATH),
+        ("~/.gitconfig", os.path.join(HOME, ".gitconfig")),
+        ("~/.gitignore_global", os.path.join(HOME, ".gitignore_global")),
+        ("~/.local/bin/*-mgr", os.path.join(HOME, ".local", "bin")),
+    ]
+
+    results = []
+    for label, path in items:
+        if label == "~/.local/bin/*-mgr":
+            mgrs = sorted(glob.glob(os.path.join(path, "*-mgr")))
+            if not mgrs:
+                results.append((label, "NONE"))
+                continue
+            stowed = sum(
+                1 for m in mgrs
+                if os.path.islink(m)
+                and os.path.exists(m)
+                and STOW_DIR in os.path.realpath(m)
+            )
+            bared = sum(1 for m in mgrs if os.path.relpath(m, HOME) in bare_files)
+            if stowed == len(mgrs):
+                results.append((label, f"STOW SYMLINK ({stowed}/{len(mgrs)} OK)"))
+            elif stowed > 0:
+                results.append((label, f"PARTIAL STOW ({stowed}/{len(mgrs)})"))
+            elif bared > 0:
+                results.append((label, f"BARE TRACKED ({bared}/{len(mgrs)})"))
+            else:
+                results.append((label, f"UNTRACKED ({len(mgrs)} scripts)"))
+            continue
+
+        if os.path.islink(path):
+            target = os.path.realpath(path)
+            if not os.path.exists(path):
+                results.append((label, "BROKEN SYMLINK"))
+            elif STOW_DIR in target:
+                results.append((label, "STOW SYMLINK (OK)"))
+            else:
+                results.append((label, f"SYMLINK -> {target}"))
+            continue
+
+        if not os.path.exists(path):
+            results.append((label, "MISSING"))
+            continue
+
+        rel = os.path.relpath(path, HOME)
+        if any(f == rel or f.startswith(rel + "/") for f in bare_files):
+            results.append((label, "BARE TRACKED (OK)"))
+        else:
+            results.append((label, "UNTRACKED (Local)"))
+
+    return results
+
+
+def get_full_state() -> dict:
+    has_git = bool(shutil.which("git"))
+    has_stow = bool(shutil.which("stow"))
+    bare_ok = is_bare_ready()
+    stow_ok = is_stow_ready()
+
+    alias_ok = False
+    if os.path.exists(ZSHRC_PATH):
+        with open(ZSHRC_PATH, "r", encoding="utf-8") as f:
+            alias_ok = "alias dots=" in f.read()
+
+    stow_pkgs = []
+    if stow_ok:
+        stow_pkgs = sorted(
+            d for d in os.listdir(STOW_DIR)
+            if os.path.isdir(os.path.join(STOW_DIR, d)) and not d.startswith(".")
+        )
+
+    return {
+        "has_git": has_git,
+        "has_stow": has_stow,
+        "bare_ok": bare_ok,
+        "stow_ok": stow_ok,
+        "alias_ok": alias_ok,
+        "bare": get_repo_metrics("bare") if bare_ok else None,
+        "stow": get_repo_metrics("stow") if stow_ok else None,
+        "stow_pkgs": stow_pkgs,
+        "targets": check_target_coverage(),
+    }
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    try:
+        win.addstr(y, x, text[: max_x - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def prompt_line(stdscr, label: str, initial: str = "") -> str | None:
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)
+    curses.curs_set(1)
+    buf = list(initial)
+
+    try:
+        while True:
+            max_y, max_x = stdscr.getmaxyx()
+            row_p = max(1, max_y - 4)
+            stdscr.move(row_p, 0)
+            stdscr.clrtoeol()
+            stdscr.move(row_p + 1, 0)
+            stdscr.clrtoeol()
+
+            c_prompt = curses.color_pair(1) | curses.A_BOLD
+            safe_addstr(stdscr, row_p, 2, f"{label} (Enter=Confirm, Esc=Cancel):", c_prompt)
+            text_str = "".join(buf)
+            visible_w = max(10, max_x - 8)
+            shown = text_str[-visible_w:]
+            safe_addstr(stdscr, row_p + 1, 4, f"> {shown}", curses.A_BOLD)
+            try:
+                stdscr.move(row_p + 1, min(max_x - 2, 6 + len(shown)))
+            except curses.error:
+                pass
+            stdscr.refresh()
+
+            ch = stdscr.get_wch()
+            if ch in ("\n", "\r", 10, 13, curses.KEY_ENTER):
+                return "".join(buf).strip()
+            elif ch in ("\x1b", 27):
+                return None
+            elif ch in ("\x7f", "\b", 127, 8, curses.KEY_BACKSPACE):
+                if buf:
+                    buf.pop()
+            elif isinstance(ch, str) and ch.isprintable():
+                buf.append(ch)
+    finally:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(1000)
+
+
+def resolve_mode(stdscr, allow_prompt: bool = True) -> str | None:
+    b = is_bare_ready()
+    s = is_stow_ready()
+    if s and not b:
+        return "stow"
+    if b and not s:
+        return "bare"
+    if not b and not s:
+        return None
+
+    # Both exist: prefer whichever has commits or a remote if one is empty
+    bm = get_repo_metrics("bare")
+    sm = get_repo_metrics("stow")
+    if sm["commits"] > 0 and bm["commits"] == 0 and bm["remote"] == "UNSET":
+        return "stow"
+    if bm["commits"] > 0 and sm["commits"] == 0 and sm["remote"] == "UNSET":
+        return "bare"
+
+    if not allow_prompt:
+        return "stow"
+
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)
+    try:
+        max_y, _ = stdscr.getmaxyx()
+        row = max(1, max_y - 3)
+        stdscr.move(row, 0)
+        stdscr.clrtoeol()
+        safe_addstr(
+            stdscr,
+            row,
+            2,
+            "Both Bare & Stow exist — press [s] GNU Stow or [b] Bare Git (Esc=Cancel):",
+            curses.color_pair(3) | curses.A_BOLD,
+        )
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord("s"), ord("S")):
+            return "stow"
+        if ch in (ord("b"), ord("B")):
+            return "bare"
+        return None
+    finally:
+        stdscr.nodelay(True)
+        stdscr.timeout(1000)
+
+
+def run_interactive_cmd(stdscr, cmd: list[str], banner: str, pause_after: bool = True) -> int:
+    curses.def_prog_mode()
+    curses.endwin()
+    print(f"\n[dotfiles-mgr] {banner}\n")
+    proc = subprocess.run(cmd)
+    if pause_after:
+        input(f"\n[dotfiles-mgr] Finished (exit code {proc.returncode}). Press Enter to return to TUI...")
+    curses.reset_prog_mode()
+    stdscr.refresh()
+    return proc.returncode
+
+
+def ensure_github_known_host() -> None:
+    ssh_dir = os.path.join(HOME, ".ssh")
+    kh_path = os.path.join(ssh_dir, "known_hosts")
+    os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+    existing = ""
+    if os.path.exists(kh_path):
+        with open(kh_path, "r", encoding="utf-8", errors="ignore") as f:
+            existing = f.read()
+    if "github.com" not in existing:
+        rc, out, _ = run_cmd(["ssh-keyscan", "-t", "ed25519", "github.com"], timeout=8)
+        if rc == 0 and out:
+            with open(kh_path, "a", encoding="utf-8") as f:
+                f.write(out.strip() + "\n")
+            os.chmod(kh_path, 0o600)
+
+
+def action_init_stow(stdscr) -> str:
+    if not shutil.which("stow"):
+        rc = run_interactive_cmd(
+            stdscr,
+            ["sudo", "pacman", "-S", "--needed", "stow"],
+            "Installing GNU Stow via pacman...",
+            pause_after=False,
+        )
+        if rc != 0 or not shutil.which("stow"):
+            return "ERROR: Failed installing GNU Stow."
+
+    os.makedirs(STOW_DIR, exist_ok=True)
+    for pkg in ("hypr", "zsh", "git", "scripts"):
+        os.makedirs(os.path.join(STOW_DIR, pkg), exist_ok=True)
+
+    if not is_stow_ready():
+        rc, _, err = run_cmd(["git", "init", "--initial-branch=main", STOW_DIR])
+        if rc != 0:
+            return f"ERROR: git init ~/dotfiles failed: {err}"
+
+    gi_path = os.path.join(STOW_DIR, ".gitignore")
+    if not os.path.exists(gi_path):
+        with open(gi_path, "w", encoding="utf-8") as f:
+            f.write("*.bak\n*.swp\n*.swo\n.DS_Store\n")
+
+    return "PASS: GNU Stow repo ready at ~/dotfiles (packages: hypr, zsh, git, scripts)."
+
+
+def action_init_bare() -> str:
+    if not is_bare_ready():
+        rc, _, err = run_cmd(["git", "init", "--bare", "--initial-branch=main", BARE_DIR])
+        if rc != 0:
+            return f"ERROR: git init --bare failed: {err}"
+
+    bare_git("config", "--local", "status.showUntrackedFiles", "no")
+
+    alias_line = "alias dots='/usr/bin/git --git-dir=$HOME/.dotfiles/ --work-tree=$HOME'"
+    existing = ""
+    if os.path.exists(ZSHRC_PATH):
+        with open(ZSHRC_PATH, "r", encoding="utf-8") as f:
+            existing = f.read()
+
+    if "alias dots=" not in existing:
+        with open(ZSHRC_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n# Bare dotfiles repository alias\n{alias_line}\n")
+
+    return "PASS: Bare Git repo ready at ~/.dotfiles + 'dots' alias added to ~/.zshrc."
+
+
+def action_adopt_and_sync(stdscr) -> str:
+    mode = resolve_mode(stdscr)
+    if mode is None:
+        return "WARN: Initialize a repo first with [1] GNU Stow or [2] Bare Git."
+
+    if mode == "bare":
+        candidates = []
+        hypr_dir = os.path.join(HOME, ".config", "hypr")
+        if os.path.isdir(hypr_dir):
+            for root, _, files in os.walk(hypr_dir):
+                for fn in files:
+                    if not fn.endswith(".bak"):
+                        candidates.append(os.path.join(root, fn))
+
+        for single in (
+            ZSHRC_PATH,
+            os.path.join(HOME, ".gitconfig"),
+            os.path.join(HOME, ".gitignore_global"),
+        ):
+            if os.path.exists(single):
+                candidates.append(single)
+
+        candidates.extend(sorted(glob.glob(os.path.join(HOME, ".local", "bin", "*-mgr"))))
+        if not candidates:
+            return "WARN: No workstation configs found to stage."
+
+        rc, _, err = bare_git("add", *candidates)
+        if rc != 0:
+            return f"ERROR: Bare git add failed: {err}"
+        return f"PASS: Staged {len(candidates)} files in ~/.dotfiles (press [5] to commit)."
+
+    if not shutil.which("stow"):
+        return "ERROR: GNU Stow is not installed — press [1] first."
+
+    moved = 0
+
+    def adopt_path(src: str, pkg: str) -> None:
+        nonlocal moved
+        if not os.path.exists(src) or os.path.islink(src):
+            return
+        rel = os.path.relpath(src, HOME)
+        dst = os.path.join(STOW_DIR, pkg, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+        moved += 1
+
+    adopt_path(os.path.join(HOME, ".config", "hypr"), "hypr")
+    adopt_path(ZSHRC_PATH, "zsh")
+    adopt_path(os.path.join(HOME, ".gitconfig"), "git")
+    adopt_path(os.path.join(HOME, ".gitignore_global"), "git")
+
+    for scr in sorted(glob.glob(os.path.join(HOME, ".local", "bin", "*-mgr"))):
+        adopt_path(scr, "scripts")
+
+    pkgs = sorted(
+        d for d in os.listdir(STOW_DIR)
+        if os.path.isdir(os.path.join(STOW_DIR, d)) and not d.startswith(".")
+    )
+    if pkgs:
+        rc, _, err = run_cmd(["stow", "-d", STOW_DIR, "-t", HOME, "--restow", *pkgs])
+        if rc != 0:
+            return f"ERROR: stow --restow failed: {err}"
+
+    stow_git("add", "-A")
+    return f"PASS: Adopted {moved} new items, verified symlinks via stow, and staged changes."
+
+
+def action_set_remote(stdscr) -> str:
+    mode = resolve_mode(stdscr)
+    if mode is None:
+        return "WARN: Initialize a repo first with [1] GNU Stow or [2] Bare Git."
+
+    fn = bare_git if mode == "bare" else stow_git
+    _, cur_url, _ = fn("remote", "get-url", "origin")
+    raw_url = prompt_line(stdscr, f"Remote 'origin' ({mode}) — accepts SSH, HTTPS, or user/repo", cur_url)
+    if not raw_url:
+        return "Cancelled remote setup."
+
+    new_url = raw_url
+    has_ssh_pub = os.path.exists(SSH_PUB)
+
+    # Normalize shorthand "user/repo" or HTTPS GitHub URL to SSH when ed25519 key exists
+    m_https = re.match(r"^https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", raw_url)
+    m_short = re.match(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$", raw_url)
+    if m_https and has_ssh_pub:
+        new_url = f"git@github.com:{m_https.group(1)}/{m_https.group(2)}.git"
+    elif m_short:
+        if has_ssh_pub:
+            new_url = f"git@github.com:{m_short.group(1)}/{m_short.group(2)}.git"
+        else:
+            new_url = f"https://github.com/{m_short.group(1)}/{m_short.group(2)}.git"
+
+    if cur_url:
+        rc, _, err = fn("remote", "set-url", "origin", new_url)
+    else:
+        rc, _, err = fn("remote", "add", "origin", new_url)
+
+    if rc != 0:
+        return f"ERROR: Failed setting origin: {err}"
+    return f"PASS: Remote 'origin' ({mode}) set to {new_url}."
+
+
+def action_commit_snapshot(stdscr) -> str:
+    mode = resolve_mode(stdscr)
+    if mode is None:
+        return "WARN: Initialize a repo first with [1] GNU Stow or [2] Bare Git."
+
+    fn = bare_git if mode == "bare" else stow_git
+    if mode == "bare":
+        fn("add", "-u")
+    else:
+        fn("add", "-A")
+
+    _, st_out, _ = fn("status", "--porcelain")
+    if not st_out.strip():
+        return "WARN: Working tree is clean — nothing to commit (press [3] to adopt new files)."
+
+    default_msg = f"chore(dotfiles): snapshot {time.strftime('%Y-%m-%d %H:%M')}"
+    msg = prompt_line(stdscr, f"Commit message ({mode})", default_msg)
+    if not msg:
+        return "Cancelled commit."
+
+    rc, _, err = fn("commit", "-m", msg)
+    if rc != 0:
+        return f"ERROR: git commit failed: {err[:60]}"
+    return f"PASS: Committed snapshot to {mode} repo ('{msg[:38]}')."
+
+
+def action_push_origin(stdscr) -> str:
+    mode = resolve_mode(stdscr)
+    if mode is None:
+        return "WARN: Initialize a repo first with [1] GNU Stow or [2] Bare Git."
+
+    metrics = get_repo_metrics(mode)
+    if metrics["commits"] == 0:
+        return "WARN: No commits yet — press [5] to create an initial commit before pushing."
+    if metrics["remote"] == "UNSET":
+        return "WARN: Remote 'origin' is unset — press [4] to configure your GitHub URL first."
+
+    if "github.com" in metrics["remote"] and metrics["remote"].startswith("git@"):
+        ensure_github_known_host()
+
+    cmd = (
+        ["git", f"--git-dir={BARE_DIR}", f"--work-tree={HOME}", "push", "-u", "origin", "HEAD"]
+        if mode == "bare"
+        else ["git", "-C", STOW_DIR, "push", "-u", "origin", "HEAD"]
+    )
+    rc = run_interactive_cmd(
+        stdscr,
+        cmd,
+        f"Pushing {mode} dotfiles ({metrics['branch']}) -> {metrics['remote']}...",
+        pause_after=True,
+    )
+    if rc != 0:
+        return f"ERROR: git push failed (exit code {rc}). Verify SSH key or repo permissions."
+    return f"PASS: Pushed {mode} dotfiles to {metrics['remote']}."
+
+
+def action_pull_origin(stdscr) -> str:
+    mode = resolve_mode(stdscr)
+    if mode is None:
+        return "WARN: Initialize a repo first with [1] GNU Stow or [2] Bare Git."
+
+    metrics = get_repo_metrics(mode)
+    if metrics["remote"] == "UNSET":
+        return "WARN: Remote 'origin' is unset — press [4] first."
+
+    if "github.com" in metrics["remote"] and metrics["remote"].startswith("git@"):
+        ensure_github_known_host()
+
+    cmd = (
+        ["git", f"--git-dir={BARE_DIR}", f"--work-tree={HOME}", "pull", "--rebase"]
+        if mode == "bare"
+        else ["git", "-C", STOW_DIR, "pull", "--rebase"]
+    )
+    rc = run_interactive_cmd(
+        stdscr,
+        cmd,
+        f"Pulling latest changes for {mode} dotfiles from {metrics['remote']}...",
+        pause_after=True,
+    )
+    if rc != 0:
+        return f"ERROR: git pull --rebase failed (exit code {rc})."
+
+    if mode == "stow" and shutil.which("stow"):
+        pkgs = sorted(
+            d for d in os.listdir(STOW_DIR)
+            if os.path.isdir(os.path.join(STOW_DIR, d)) and not d.startswith(".")
+        )
+        if pkgs:
+            run_cmd(["stow", "-d", STOW_DIR, "-t", HOME, "--restow", *pkgs])
+
+    return "PASS: Pulled updates and refreshed symlinks."
+
+
+def action_cleanup_unused_repo(stdscr) -> str:
+    b = is_bare_ready()
+    s = is_stow_ready()
+    if not (b and s):
+        return "OK: Only one repository strategy exists — nothing to clean up."
+
+    bm = get_repo_metrics("bare")
+    sm = get_repo_metrics("stow")
+
+    if bm["commits"] == 0 and sm["commits"] > 0:
+        shutil.rmtree(BARE_DIR, ignore_errors=True)
+        if os.path.exists(ZSHRC_PATH):
+            lines = open(ZSHRC_PATH, "r", encoding="utf-8").readlines()
+            kept = [l for l in lines if "# Bare dotfiles repository alias" not in l and "alias dots=" not in l]
+            open(ZSHRC_PATH, "w", encoding="utf-8").writelines(kept)
+        return "PASS: Removed unused empty ~/.dotfiles bare repo and 'dots' alias."
+
+    if sm["commits"] == 0 and bm["commits"] > 0:
+        shutil.rmtree(STOW_DIR, ignore_errors=True)
+        return "PASS: Removed unused empty ~/dotfiles Stow directory."
+
+    return "WARN: Both repos have commits — delete ~/.dotfiles or ~/dotfiles manually if desired."
+
+
+def show_overlay(stdscr, title: str, lines: list[str]) -> None:
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)
+    offset = 0
+    try:
+        while True:
+            stdscr.erase()
+            max_y, _ = stdscr.getmaxyx()
+            page_size = max(5, max_y - 6)
+            c_title = curses.color_pair(1) | curses.A_BOLD
+            safe_addstr(stdscr, 1, 2, title, c_title)
+            safe_addstr(stdscr, 2, 2, "=" * 78, curses.color_pair(1))
+
+            visible = lines[offset : offset + page_size]
+            for idx, line in enumerate(visible):
+                safe_addstr(stdscr, 4 + idx, 4, line)
+
+            footer = f"Lines {offset + 1}-{min(len(lines), offset + page_size)}/{len(lines)}  |  [j/Down] Scroll  [k/Up] Scroll  [q/Esc] Back"
+            safe_addstr(stdscr, max_y - 2, 2, footer, curses.color_pair(3) | curses.A_BOLD)
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if ch in (ord("q"), ord("Q"), 27, 10, 13):
+                break
+            elif ch in (ord("j"), curses.KEY_DOWN) and offset + page_size < len(lines):
+                offset += 1
+            elif ch in (ord("k"), curses.KEY_UP) and offset > 0:
+                offset -= 1
+    finally:
+        stdscr.nodelay(True)
+        stdscr.timeout(1000)
+
+
+def action_view_tracked(stdscr) -> None:
+    mode = resolve_mode(stdscr)
+    if mode is None:
+        return
+    fn = bare_git if mode == "bare" else stow_git
+    _, out, _ = fn("ls-files")
+    lines = out.splitlines() if out else ["(No tracked files yet — press [3] to adopt/stage configs)"]
+    show_overlay(stdscr, f"razorbillOS // Tracked Files ({mode.upper()})", lines)
+
+
+def action_view_diff(stdscr) -> None:
+    mode = resolve_mode(stdscr)
+    if mode is None:
+        return
+    fn = bare_git if mode == "bare" else stow_git
+    _, st_out, _ = fn("status", "--short")
+    _, df_out, _ = fn("diff", "--stat")
+    lines = ["=== git status --short ==="]
+    lines.extend(st_out.splitlines() if st_out else ["(Clean working tree)"])
+    lines.append("")
+    lines.append("=== git diff --stat (unstaged) ===")
+    lines.extend(df_out.splitlines() if df_out else ["(No unstaged diff)"])
+    show_overlay(stdscr, f"razorbillOS // Status & Diff ({mode.upper()})", lines)
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)
+
+    status_msg = "Ready. [3] Adopt/Restow  [4] Set Remote  [5] Commit  [6] Push to Origin."
+    st = get_full_state()
+    last_poll = time.time()
+
+    while True:
+        if time.time() - last_poll >= 3.0:
+            st = get_full_state()
+            last_poll = time.time()
+
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        c_ok = curses.color_pair(2) | curses.A_BOLD
+        c_warn = curses.color_pair(3) | curses.A_BOLD
+        c_err = curses.color_pair(4) | curses.A_BOLD
+
+        safe_addstr(stdscr, 1, 2, "razorbillOS // Dotfiles Repository & Symlink Manager", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 78, curses.color_pair(1))
+
+        # Section 1: Strategy & Tooling
+        safe_addstr(stdscr, 4, 2, "[ STRATEGY & TOOLING ]", c_title)
+        if st["bare_ok"] and st["stow_ok"]:
+            strat = "BOTH DETECTED (Press [x] to clean up unused empty repo)"
+            strat_col = c_warn
+        elif st["stow_ok"]:
+            strat = f"GNU STOW (~/dotfiles)  |  Packages: {', '.join(st['stow_pkgs']) or 'none'}"
+            strat_col = c_ok
+        elif st["bare_ok"]:
+            strat = "BARE GIT (~/.dotfiles)"
+            strat_col = c_ok
+        else:
+            strat = "UNINITIALIZED (Press [1] GNU Stow or [2] Bare Git)"
+            strat_col = c_warn
+
+        safe_addstr(stdscr, 5, 4, f"Active Strategy   : {strat}", strat_col)
+        safe_addstr(
+            stdscr,
+            6,
+            4,
+            f"Binaries & Shell  : git={'OK' if st['has_git'] else 'MISSING'} | stow={'INSTALLED' if st['has_stow'] else 'NOT INSTALLED'} | zsh dots alias={'YES' if st['alias_ok'] else 'NO'}",
+        )
+
+        # Section 2: Active Repository Telemetry
+        safe_addstr(stdscr, 8, 2, "[ REPOSITORY SYNC & WORKING TREE ]", c_title)
+        active_m = st["stow"] if st["stow_ok"] else st["bare"]
+        active_label = "Stow (~/dotfiles)" if st["stow_ok"] else ("Bare (~/.dotfiles)" if st["bare_ok"] else "None")
+
+        if active_m:
+            sync_str = f"{active_m['upstream']} (ahead {active_m['ahead']}, behind {active_m['behind']})"
+            safe_addstr(
+                stdscr,
+                9,
+                4,
+                f"Repo & Branch     : {active_label}  |  branch={active_m['branch']}  |  commits={active_m['commits']}",
+                c_ok if active_m["commits"] > 0 else c_warn,
+            )
+            safe_addstr(
+                stdscr,
+                10,
+                4,
+                f"Remote & Upstream : {active_m['remote']}  [{sync_str}]",
+                c_ok if active_m["remote"] != "UNSET" else c_warn,
+            )
+            safe_addstr(
+                stdscr,
+                11,
+                4,
+                f"Tracked & Dirty   : {active_m['tracked']} tracked files  |  {active_m['dirty']} uncommitted changes",
+                c_ok if active_m["dirty"] == 0 else c_warn,
+            )
+        else:
+            safe_addstr(stdscr, 9, 4, "No dotfiles repository initialized yet.", c_warn)
+
+        # Section 3: Workstation Coverage
+        safe_addstr(stdscr, 13, 2, "[ WORKSTATION CONFIG & SYMLINK COVERAGE ]", c_title)
+        y = 14
+        for label, state_txt in st["targets"]:
+            t_col = (
+                c_ok
+                if "(OK)" in state_txt
+                else (c_err if ("BROKEN" in state_txt or state_txt == "MISSING") else c_warn)
+            )
+            safe_addstr(stdscr, y, 4, f"{label:<22}: {state_txt}", t_col)
+            y += 1
+
+        # Section 4: Actions
+        safe_addstr(stdscr, 20, 2, "[ ACTIONS ]", c_title)
+        safe_addstr(stdscr, 21, 4, "[1] Init GNU Stow (~/dotfiles)          [5] Commit Snapshot")
+        safe_addstr(stdscr, 22, 4, "[2] Init Bare Git (~/.dotfiles)         [6] Push to Origin (Interactive)")
+        safe_addstr(stdscr, 23, 4, "[3] Adopt & Restow Configs/Scripts      [7] Pull --rebase & Restow")
+        safe_addstr(stdscr, 24, 4, "[4] Set GitHub Remote (Auto-SSH)        [d] Diff  [v] Files  [x] Cleanup  [q] Quit")
+
+        max_y, _ = stdscr.getmaxyx()
+        bar_y = max(26, max_y - 3)
+        safe_addstr(stdscr, bar_y, 2, "-" * 78, curses.color_pair(1))
+        msg_col = (
+            c_err
+            if status_msg.startswith(("ERROR", "FAIL"))
+            else (c_ok if status_msg.startswith(("OK", "PASS")) else c_warn)
+        )
+        safe_addstr(stdscr, bar_y + 1, 2, f"Status: {status_msg}", msg_col)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        elif ch in (ord("q"), ord("Q")):
+            break
+        elif ch == ord("1"):
+            status_msg = action_init_stow(stdscr)
+            st = get_full_state()
+        elif ch == ord("2"):
+            status_msg = action_init_bare()
+            st = get_full_state()
+        elif ch == ord("3"):
+            status_msg = action_adopt_and_sync(stdscr)
+            st = get_full_state()
+        elif ch == ord("4"):
+            status_msg = action_set_remote(stdscr)
+            st = get_full_state()
+        elif ch == ord("5"):
+            status_msg = action_commit_snapshot(stdscr)
+            st = get_full_state()
+        elif ch == ord("6"):
+            status_msg = action_push_origin(stdscr)
+            st = get_full_state()
+        elif ch == ord("7"):
+            status_msg = action_pull_origin(stdscr)
+            st = get_full_state()
+        elif ch in (ord("d"), ord("D")):
+            action_view_diff(stdscr)
+        elif ch in (ord("v"), ord("V")):
+            action_view_tracked(stdscr)
+        elif ch in (ord("x"), ord("X")):
+            status_msg = action_cleanup_unused_repo(stdscr)
+            st = get_full_state()
+        elif ch in (ord("r"), ord("R")):
+            st = get_full_state()
+            status_msg = "Refreshed repository, remote, and symlink status."
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

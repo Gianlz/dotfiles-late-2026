@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+import curses
+import os
+import shutil
+import subprocess
+import time
+
+SSH_PRIV = os.path.expanduser("~/.ssh/id_ed25519")
+SSH_PUB = os.path.expanduser("~/.ssh/id_ed25519.pub")
+GLOBAL_IGNORE = os.path.expanduser("~/.gitignore_global")
+
+MODERN_DEFAULTS = {
+    "init.defaultBranch": "main",
+    "core.editor": "nvim",
+    "core.autocrlf": "input",
+    "push.autoSetupRemote": "true",
+    "pull.rebase": "false",
+    "fetch.prune": "true",
+    "rerere.enabled": "true",
+    "diff.colorMoved": "default",
+    "merge.conflictstyle": "zdiff3",
+}
+
+
+def run_cmd(args: list[str], timeout: int = 8) -> tuple[int, str, str]:
+    try:
+        res = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def gcfg(key: str, default: str = "UNSET") -> str:
+    rc, out, _ = run_cmd(["git", "config", "--global", "--get", key])
+    return out.strip() if rc == 0 and out.strip() else default
+
+
+def get_git_state() -> dict:
+    has_git = bool(shutil.which("git"))
+    if not has_git:
+        return {"has_git": False}
+
+    name = gcfg("user.name")
+    email = gcfg("user.email")
+    gpg_fmt = gcfg("gpg.format", "openpgp")
+    gpg_sign = gcfg("commit.gpgsign", "false")
+    sign_key = gcfg("user.signingkey")
+
+    branch = gcfg("init.defaultBranch")
+    editor = gcfg("core.editor")
+    auto_remote = gcfg("push.autoSetupRemote", "false")
+    prune = gcfg("fetch.prune", "false")
+    rerere = gcfg("rerere.enabled", "false")
+    conflict = gcfg("merge.conflictstyle", "merge")
+    autocrlf = gcfg("core.autocrlf", "unset")
+    excludes = gcfg("core.excludesfile")
+
+    defaults_ok = all(gcfg(k) == v for k, v in MODERN_DEFAULTS.items())
+
+    has_ssh_key = os.path.exists(SSH_PRIV) and os.path.exists(SSH_PUB)
+    key_comment = ""
+    if has_ssh_key:
+        try:
+            parts = open(SSH_PUB, "r", encoding="utf-8").read().strip().split()
+            key_comment = parts[2] if len(parts) >= 3 else "ed25519"
+        except Exception:
+            key_comment = "ed25519"
+
+    rc_agent, agent_out, _ = run_cmd(["ssh-add", "-l"], timeout=2)
+    agent_loaded = rc_agent == 0 and "no identities" not in agent_out.lower()
+
+    has_gh = bool(shutil.which("gh"))
+    gh_authed = False
+    if has_gh:
+        rc_gh, _, _ = run_cmd(["gh", "auth", "status"], timeout=4)
+        gh_authed = rc_gh == 0
+
+    return {
+        "has_git": True,
+        "name": name,
+        "email": email,
+        "gpg_fmt": gpg_fmt,
+        "gpg_sign": gpg_sign,
+        "sign_key": sign_key,
+        "branch": branch,
+        "editor": editor,
+        "auto_remote": auto_remote,
+        "prune": prune,
+        "rerere": rerere,
+        "conflict": conflict,
+        "autocrlf": autocrlf,
+        "excludes": excludes,
+        "defaults_ok": defaults_ok,
+        "has_ssh_key": has_ssh_key,
+        "key_comment": key_comment,
+        "agent_loaded": agent_loaded,
+        "has_gh": has_gh,
+        "gh_authed": gh_authed,
+    }
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    try:
+        win.addstr(y, x, text[: max_x - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def prompt_line(stdscr, label: str, current: str = "") -> str | None:
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)
+    curses.curs_set(1)
+    buf = list(current if current != "UNSET" else "")
+
+    try:
+        while True:
+            max_y, max_x = stdscr.getmaxyx()
+            row_p = min(25, max_y - 3)
+            stdscr.move(row_p, 0)
+            stdscr.clrtoeol()
+            stdscr.move(row_p + 1, 0)
+            stdscr.clrtoeol()
+
+            c_prompt = curses.color_pair(1) | curses.A_BOLD
+            safe_addstr(stdscr, row_p, 2, f"{label} (Enter=Save, Esc=Cancel):", c_prompt)
+            text_str = "".join(buf)
+            visible_w = max(10, max_x - 8)
+            shown = text_str[-visible_w:]
+            safe_addstr(stdscr, row_p + 1, 4, f"> {shown}", curses.A_BOLD)
+            try:
+                stdscr.move(row_p + 1, min(max_x - 2, 6 + len(shown)))
+            except curses.error:
+                pass
+            stdscr.refresh()
+
+            ch = stdscr.get_wch()
+            if ch in ("\n", "\r", curses.KEY_ENTER):
+                return "".join(buf).strip()
+            elif ch == "\x1b":
+                return None
+            elif ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                if buf:
+                    buf.pop()
+            elif isinstance(ch, str) and ch.isprintable():
+                buf.append(ch)
+    finally:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.timeout(1000)
+
+
+def run_interactive_cmd(stdscr, cmd: list[str], banner: str, pause_after: bool = True) -> int:
+    curses.def_prog_mode()
+    curses.endwin()
+    print(f"\n[git-mgr] {banner}\n")
+    proc = subprocess.run(cmd)
+    if pause_after:
+        input(f"\n[git-mgr] Finished (exit code {proc.returncode}). Press Enter to return to TUI...")
+    curses.reset_prog_mode()
+    stdscr.refresh()
+    return proc.returncode
+
+
+def action_edit_identity(stdscr) -> str:
+    cur_name = gcfg("user.name", "")
+    cur_email = gcfg("user.email", "")
+
+    new_name = prompt_line(stdscr, "Git user.name", cur_name)
+    if new_name is None:
+        return "Cancelled identity edit."
+    new_email = prompt_line(stdscr, "Git user.email", cur_email)
+    if new_email is None:
+        return "Cancelled identity edit."
+
+    if new_name:
+        run_cmd(["git", "config", "--global", "user.name", new_name])
+    if new_email:
+        run_cmd(["git", "config", "--global", "user.email", new_email])
+
+    final_name = gcfg("user.name")
+    final_email = gcfg("user.email")
+    if final_name != "UNSET" and final_email != "UNSET":
+        return f"PASS: Git identity set to {final_name} ({final_email})."
+    return "WARN: Name or email is still unset."
+
+
+def action_apply_modern_defaults() -> str:
+    for k, v in MODERN_DEFAULTS.items():
+        rc, _, err = run_cmd(["git", "config", "--global", k, v])
+        if rc != 0:
+            return f"ERROR: Failed setting {k}: {err}"
+    return "PASS: Applied modern Git workflow defaults (main, nvim, autoSetupRemote, zdiff3)."
+
+
+def action_ssh_keygen_and_copy(stdscr) -> str:
+    os.makedirs(os.path.expanduser("~/.ssh"), mode=0o700, exist_ok=True)
+    if not (os.path.exists(SSH_PRIV) and os.path.exists(SSH_PUB)):
+        email = gcfg("user.email", "")
+        if not email:
+            entered = prompt_line(stdscr, "Email comment for new ed25519 SSH key", "")
+            if not entered:
+                return "Cancelled SSH key generation (email required)."
+            email = entered
+
+        rc = run_interactive_cmd(
+            stdscr,
+            ["ssh-keygen", "-t", "ed25519", "-C", email, "-f", SSH_PRIV],
+            "Generating ed25519 SSH keypair (press Enter twice for empty passphrase)...",
+            pause_after=False,
+        )
+        if rc != 0 or not os.path.exists(SSH_PUB):
+            return "ERROR: ssh-keygen failed or was aborted."
+
+    pub_key = open(SSH_PUB, "r", encoding="utf-8").read().strip()
+    if shutil.which("wl-copy"):
+        subprocess.run(["wl-copy"], input=pub_key, text=True, check=False)
+        return "PASS: ~/.ssh/id_ed25519.pub ready & copied to Wayland clipboard (paste into GitHub)."
+    return f"OK: Key ready at {SSH_PUB} (install wl-clipboard to auto-copy)."
+
+
+def action_toggle_ssh_signing() -> str:
+    if not os.path.exists(SSH_PUB):
+        return "WARN: Generate ~/.ssh/id_ed25519 first with [3] before enabling SSH commit signing."
+
+    currently_on = gcfg("commit.gpgsign") == "true" and gcfg("gpg.format") == "ssh"
+    if currently_on:
+        run_cmd(["git", "config", "--global", "commit.gpgsign", "false"])
+        run_cmd(["git", "config", "--global", "tag.gpgsign", "false"])
+        return "OK: Disabled automatic SSH commit signing."
+
+    run_cmd(["git", "config", "--global", "gpg.format", "ssh"])
+    run_cmd(["git", "config", "--global", "user.signingkey", SSH_PUB])
+    run_cmd(["git", "config", "--global", "commit.gpgsign", "true"])
+    run_cmd(["git", "config", "--global", "tag.gpgsign", "true"])
+    return "PASS: Enabled SSH commit & tag signing using ~/.ssh/id_ed25519.pub."
+
+
+def action_setup_global_gitignore() -> str:
+    rules = [
+        "# OS & Thumbnails",
+        ".DS_Store",
+        "Thumbs.db",
+        "# Editors & Swap",
+        "*.swp",
+        "*.swo",
+        "*~",
+        ".idea/",
+        ".vscode/",
+        "# Local Env & Tooling",
+        ".direnv/",
+        ".env.local",
+        "__pycache__/",
+    ]
+    existing = []
+    if os.path.exists(GLOBAL_IGNORE):
+        existing = [l.rstrip("\n") for l in open(GLOBAL_IGNORE, "r", encoding="utf-8")]
+
+    merged = list(existing)
+    for r in rules:
+        if r not in merged:
+            merged.append(r)
+
+    with open(GLOBAL_IGNORE, "w", encoding="utf-8") as f:
+        f.write("\n".join(merged).strip() + "\n")
+
+    rc, _, err = run_cmd(["git", "config", "--global", "core.excludesfile", GLOBAL_IGNORE])
+    if rc != 0:
+        return f"ERROR: Failed setting core.excludesfile: {err}"
+    return f"PASS: Global .gitignore active at {GLOBAL_IGNORE}."
+
+
+def action_test_github_ssh() -> str:
+    rc, out, err = run_cmd(
+        [
+            "ssh",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=6",
+            "git@github.com",
+        ],
+        timeout=10,
+    )
+    combined = f"{out} {err}".strip()
+    if "successfully authenticated" in combined.lower():
+        first_line = combined.splitlines()[0]
+        return f"PASS: {first_line}"
+    if "permission denied" in combined.lower():
+        return "WARN: Permission denied — press [3] to copy public key and add it at github.com/settings/keys."
+    return f"FAIL (rc={rc}): {combined[:64]}"
+
+
+def action_gh_cli_login(stdscr) -> str:
+    if not shutil.which("gh"):
+        rc = run_interactive_cmd(
+            stdscr,
+            ["sudo", "pacman", "-S", "--needed", "github-cli"],
+            "Installing GitHub CLI (github-cli)...",
+            pause_after=False,
+        )
+        if rc != 0:
+            return "ERROR: Failed installing github-cli."
+
+    rc_login = run_interactive_cmd(
+        stdscr,
+        ["gh", "auth", "login", "-p", "ssh", "-h", "github.com"],
+        "Launching interactive GitHub CLI authentication (SSH protocol)...",
+        pause_after=True,
+    )
+    if rc_login != 0:
+        return "WARN: gh auth login did not complete."
+    return "PASS: GitHub CLI authenticated over SSH."
+
+
+def action_view_gitconfig(stdscr) -> None:
+    _, out, _ = run_cmd(["git", "config", "--global", "--list"])
+    lines = out.splitlines() if out else ["(No global git configuration entries yet)"]
+
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)
+    try:
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        safe_addstr(stdscr, 1, 2, "razorbillOS // ~/.gitconfig Active Global Entries", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 78, curses.color_pair(1))
+        for idx, line in enumerate(lines[:24]):
+            safe_addstr(stdscr, 4 + idx, 4, line)
+        safe_addstr(stdscr, 29, 2, "Press any key to return to git-mgr...", curses.color_pair(3) | curses.A_BOLD)
+        stdscr.refresh()
+        stdscr.getch()
+    finally:
+        stdscr.nodelay(True)
+        stdscr.timeout(1000)
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)
+
+    status_msg = "Ready. Press [1] Name/Email, [2] Workflow Defaults, [3] SSH Key + Copy."
+    st = get_git_state()
+    last_poll = time.time()
+
+    while True:
+        if time.time() - last_poll >= 3.0:
+            st = get_git_state()
+            last_poll = time.time()
+
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        c_ok = curses.color_pair(2) | curses.A_BOLD
+        c_warn = curses.color_pair(3) | curses.A_BOLD
+        c_err = curses.color_pair(4) | curses.A_BOLD
+
+        safe_addstr(stdscr, 1, 2, "razorbillOS // Git, SSH & Commit Signing Manager", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 78, curses.color_pair(1))
+
+        if not st.get("has_git"):
+            safe_addstr(stdscr, 5, 4, "ERROR: git is not installed. Run: sudo pacman -S git", c_err)
+            safe_addstr(stdscr, 7, 4, "Press [q] to quit.")
+            stdscr.refresh()
+            if stdscr.getch() in (ord("q"), ord("Q")):
+                break
+            continue
+
+        # Section 1: Identity & Signing
+        safe_addstr(stdscr, 4, 2, "[ IDENTITY & COMMIT SIGNING ]", c_title)
+        id_ok = st["name"] != "UNSET" and st["email"] != "UNSET"
+        safe_addstr(
+            stdscr,
+            5,
+            4,
+            f"Author Identity    : {st['name']} ({st['email']})",
+            c_ok if id_ok else c_warn,
+        )
+        sign_on = st["gpg_sign"] == "true"
+        safe_addstr(
+            stdscr,
+            6,
+            4,
+            f"Commit Signing     : {'ENABLED' if sign_on else 'OFF'}  (Format: {st['gpg_fmt']})",
+            c_ok if sign_on else c_warn,
+        )
+        safe_addstr(stdscr, 7, 4, f"Signing Key        : {st['sign_key']}")
+
+        # Section 2: Workflow & Diff Defaults
+        safe_addstr(stdscr, 9, 2, "[ WORKFLOW, DIFF & GLOBAL GITIGNORE ]", c_title)
+        safe_addstr(
+            stdscr,
+            10,
+            4,
+            f"Branch & Editor    : defaultBranch={st['branch']}  |  core.editor={st['editor']}",
+            c_ok if (st["branch"] == "main" and st["editor"] == "nvim") else c_warn,
+        )
+        safe_addstr(
+            stdscr,
+            11,
+            4,
+            f"Push/Fetch/Rerere  : autoSetupRemote={st['auto_remote']} | fetch.prune={st['prune']} | rerere={st['rerere']}",
+            c_ok if st["defaults_ok"] else c_warn,
+        )
+        safe_addstr(
+            stdscr,
+            12,
+            4,
+            f"Merge & Line Endings: conflictstyle={st['conflict']} | core.autocrlf={st['autocrlf']}",
+        )
+        ig_ok = st["excludes"] != "UNSET" and os.path.exists(os.path.expanduser(st["excludes"]))
+        safe_addstr(
+            stdscr,
+            13,
+            4,
+            f"Global Gitignore   : {st['excludes']}",
+            c_ok if ig_ok else c_warn,
+        )
+
+        # Section 3: SSH & GitHub
+        safe_addstr(stdscr, 15, 2, "[ SSH KEYPAIR & GITHUB CLI ]", c_title)
+        safe_addstr(
+            stdscr,
+            16,
+            4,
+            f"ed25519 Keypair    : {'PRESENT (' + st['key_comment'] + ')' if st['has_ssh_key'] else 'MISSING (~/.ssh/id_ed25519)'}",
+            c_ok if st["has_ssh_key"] else c_warn,
+        )
+        gh_str = (
+            "Authenticated"
+            if st["gh_authed"]
+            else ("Installed (Not logged in)" if st["has_gh"] else "Not installed")
+        )
+        safe_addstr(
+            stdscr,
+            17,
+            4,
+            f"SSH Agent / GH CLI : Agent Loaded={'YES' if st['agent_loaded'] else 'NO'}  |  gh={gh_str}",
+            c_ok if st["gh_authed"] else 0,
+        )
+
+        # Section 4: Actions
+        safe_addstr(stdscr, 19, 2, "[ ACTIONS ]", c_title)
+        safe_addstr(stdscr, 20, 4, "[1] Edit Name & Email (In-TUI)         [5] Setup Global .gitignore")
+        safe_addstr(stdscr, 21, 4, "[2] Apply Modern Git Workflow Defaults  [6] Test GitHub SSH (git@github.com)")
+        safe_addstr(stdscr, 22, 4, "[3] Generate ed25519 Key & wl-copy      [7] Install / Login GitHub CLI (gh)")
+        safe_addstr(stdscr, 23, 4, "[4] Toggle SSH Commit Signing           [v] View ~/.gitconfig  [r] Refresh  [q] Quit")
+
+        safe_addstr(stdscr, 25, 2, "-" * 78, curses.color_pair(1))
+        msg_col = (
+            c_err
+            if status_msg.startswith(("ERROR", "FAIL"))
+            else (c_ok if status_msg.startswith(("OK", "PASS")) else c_warn)
+        )
+        safe_addstr(stdscr, 26, 2, f"Status: {status_msg}", msg_col)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        elif ch in (ord("q"), ord("Q")):
+            break
+        elif ch == ord("1"):
+            status_msg = action_edit_identity(stdscr)
+            st = get_git_state()
+        elif ch == ord("2"):
+            status_msg = action_apply_modern_defaults()
+            st = get_git_state()
+        elif ch == ord("3"):
+            status_msg = action_ssh_keygen_and_copy(stdscr)
+            st = get_git_state()
+        elif ch == ord("4"):
+            status_msg = action_toggle_ssh_signing()
+            st = get_git_state()
+        elif ch == ord("5"):
+            status_msg = action_setup_global_gitignore()
+            st = get_git_state()
+        elif ch == ord("6"):
+            status_msg = "Testing SSH handshake with git@github.com..."
+            stdscr.refresh()
+            status_msg = action_test_github_ssh()
+        elif ch == ord("7"):
+            status_msg = action_gh_cli_login(stdscr)
+            st = get_git_state()
+        elif ch in (ord("v"), ord("V")):
+            action_view_gitconfig(stdscr)
+        elif ch in (ord("r"), ord("R")):
+            st = get_git_state()
+            status_msg = "Refreshed Git, SSH, and GitHub CLI state."
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

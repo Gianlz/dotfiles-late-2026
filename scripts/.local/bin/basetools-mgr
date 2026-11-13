@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+import curses
+import os
+import pwd
+import shutil
+import subprocess
+import time
+
+BASE_PKGS = ["git", "base-devel", "neovim", "zsh"]
+BUILD_BINS = ["gcc", "make", "fakeroot", "pkgconf", "patch", "autoconf", "automake"]
+
+
+def run_cmd(args: list[str], timeout: int = 6) -> tuple[int, str, str]:
+    try:
+        res = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def get_pkg_versions() -> dict[str, str]:
+    versions = {}
+    for pkg in BASE_PKGS:
+        rc, out, _ = run_cmd(["pacman", "-Q", pkg])
+        parts = out.split()
+        versions[pkg] = parts[1] if rc == 0 and len(parts) >= 2 else "MISSING"
+    return versions
+
+
+def get_build_toolchain_status() -> dict:
+    present = [b for b in BUILD_BINS if shutil.which(b)]
+    missing = [b for b in BUILD_BINS if not shutil.which(b)]
+    rc_gcc, gcc_out, _ = run_cmd(["gcc", "--version"])
+    gcc_ver = gcc_out.splitlines()[0] if rc_gcc == 0 and gcc_out else "Not installed"
+    return {
+        "present": present,
+        "missing": missing,
+        "gcc_ver": gcc_ver,
+    }
+
+
+def get_git_status() -> dict:
+    def gcfg(key: str) -> str:
+        rc, out, _ = run_cmd(["git", "config", "--global", "--get", key])
+        return out.strip() if rc == 0 and out.strip() else "UNSET"
+
+    return {
+        "name": gcfg("user.name"),
+        "email": gcfg("user.email"),
+        "branch": gcfg("init.defaultBranch"),
+        "editor": gcfg("core.editor"),
+    }
+
+
+def get_shell_and_editor_status() -> dict:
+    try:
+        login_shell = pwd.getpwuid(os.getuid()).pw_shell
+    except Exception:
+        login_shell = os.environ.get("SHELL", "unknown")
+
+    zshrc_path = os.path.expanduser("~/.zshrc")
+    zshrc_exists = os.path.exists(zshrc_path)
+    editor_persisted = False
+    if zshrc_exists:
+        with open(zshrc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        editor_persisted = "EDITOR=nvim" in content or 'EDITOR="nvim"' in content
+
+    env_editor = os.environ.get("EDITOR", "UNSET")
+    wl_clip = bool(shutil.which("wl-copy")) and bool(shutil.which("wl-paste"))
+
+    return {
+        "login_shell": login_shell,
+        "is_zsh": login_shell.endswith("/zsh"),
+        "zshrc_exists": zshrc_exists,
+        "env_editor": env_editor,
+        "editor_persisted": editor_persisted,
+        "wl_clip": wl_clip,
+    }
+
+
+def run_interactive_cmd(stdscr, cmd: list[str], banner: str, pause_after: bool = True) -> int:
+    curses.def_prog_mode()
+    curses.endwin()
+    print(f"\n[basetools-mgr] {banner}\n")
+    proc = subprocess.run(cmd)
+    if pause_after:
+        input(f"\n[basetools-mgr] Finished (exit code {proc.returncode}). Press Enter to return to TUI...")
+    curses.reset_prog_mode()
+    stdscr.refresh()
+    return proc.returncode
+
+
+def action_install_base_tools(stdscr) -> str:
+    rc = run_interactive_cmd(
+        stdscr,
+        ["sudo", "pacman", "-S", "--needed", *BASE_PKGS],
+        "Installing git, base-devel, neovim, and zsh via pacman...",
+        pause_after=True,
+    )
+    if rc != 0:
+        return f"ERROR: pacman exited with code {rc}."
+    return "PASS: git, base-devel, neovim, and zsh are installed."
+
+
+def action_configure_git(stdscr) -> str:
+    if not shutil.which("git"):
+        return "ERROR: git is not installed yet — press [1] first."
+
+    script = (
+        'cur_name=$(git config --global --get user.name || true); '
+        'cur_email=$(git config --global --get user.email || true); '
+        'echo "Current git user.name : ${cur_name:-UNSET}"; '
+        'echo "Current git user.email: ${cur_email:-UNSET}"; '
+        'echo ""; '
+        'read -rp "Enter git user.name (leave blank to keep current): " new_name; '
+        'read -rp "Enter git user.email (leave blank to keep current): " new_email; '
+        '[ -n "$new_name" ] && git config --global user.name "$new_name"; '
+        '[ -n "$new_email" ] && git config --global user.email "$new_email"; '
+        'git config --global init.defaultBranch main; '
+        'git config --global core.editor nvim; '
+        'git config --global pull.rebase false; '
+        'echo ""; '
+        'echo "Updated global git config:"; '
+        'git config --global --list'
+    )
+    rc = run_interactive_cmd(
+        stdscr,
+        ["bash", "-c", script],
+        "Configuring global Git defaults (defaultBranch=main, core.editor=nvim)...",
+        pause_after=True,
+    )
+    if rc != 0:
+        return "ERROR: Git configuration failed."
+    return "OK: Global Git defaults updated (main branch + nvim editor)."
+
+
+def action_configure_zsh_and_editor(stdscr) -> str:
+    zsh_bin = shutil.which("zsh") or "/usr/bin/zsh"
+    if not os.path.exists(zsh_bin):
+        return "ERROR: zsh binary not found — press [1] first."
+
+    try:
+        current_shell = pwd.getpwuid(os.getuid()).pw_shell
+    except Exception:
+        current_shell = ""
+
+    if not current_shell.endswith("/zsh"):
+        rc = run_interactive_cmd(
+            stdscr,
+            ["chsh", "-s", zsh_bin],
+            f"Setting default login shell to {zsh_bin}...",
+            pause_after=False,
+        )
+        if rc != 0:
+            return "ERROR: chsh failed to set zsh as login shell."
+
+    zshrc_path = os.path.expanduser("~/.zshrc")
+    existing = ""
+    if os.path.exists(zshrc_path):
+        with open(zshrc_path, "r", encoding="utf-8") as f:
+            existing = f.read()
+
+    if "EDITOR=nvim" not in existing and 'EDITOR="nvim"' not in existing:
+        with open(zshrc_path, "a", encoding="utf-8") as f:
+            f.write("\n# Default editor\nexport EDITOR=nvim\nexport VISUAL=nvim\n")
+
+    return "PASS: Default login shell verified as zsh and EDITOR=nvim persisted in ~/.zshrc."
+
+
+def action_verify_neovim_health(stdscr) -> str:
+    if not shutil.which("nvim"):
+        return "ERROR: neovim is not installed yet — press [1] first."
+
+    script = (
+        "nvim --version | head -n 3; "
+        "echo ''; "
+        "echo 'Running headless clipboard & environment healthcheck...'; "
+        "nvim --headless '+checkhealth vim.provider' '+w! /tmp/nvim_health.txt' +qa 2>/dev/null || true; "
+        "grep -E '(Clipboard|wl-copy|OK|WARNING|ERROR)' /tmp/nvim_health.txt | head -n 15 || true; "
+        "rm -f /tmp/nvim_health.txt"
+    )
+    run_interactive_cmd(
+        stdscr,
+        ["bash", "-c", script],
+        "Checking Neovim version and Wayland clipboard provider health...",
+        pause_after=True,
+    )
+    return "OK: Neovim health check completed."
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    try:
+        win.addstr(y, x, text[: max_x - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)
+
+    status_msg = "Ready. Press [1] Install Base Tools, [2] Configure Git, [3] Verify Zsh + EDITOR."
+    pkgs = get_pkg_versions()
+    tc = get_build_toolchain_status()
+    git_s = get_git_status()
+    sh_s = get_shell_and_editor_status()
+    last_poll = time.time()
+
+    def refresh_all() -> None:
+        nonlocal pkgs, tc, git_s, sh_s, last_poll
+        pkgs = get_pkg_versions()
+        tc = get_build_toolchain_status()
+        git_s = get_git_status()
+        sh_s = get_shell_and_editor_status()
+        last_poll = time.time()
+
+    while True:
+        if time.time() - last_poll >= 3.0:
+            refresh_all()
+
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        c_ok = curses.color_pair(2) | curses.A_BOLD
+        c_warn = curses.color_pair(3) | curses.A_BOLD
+        c_err = curses.color_pair(4) | curses.A_BOLD
+
+        safe_addstr(stdscr, 1, 2, "razorbillOS // Base Development & Shell Tools Manager (CachyOS)", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 78, curses.color_pair(1))
+
+        # Section 1: Core Packages
+        safe_addstr(stdscr, 4, 2, "[ CORE PACKAGES ]", c_title)
+        y = 5
+        for pkg in BASE_PKGS:
+            ver = pkgs.get(pkg, "MISSING")
+            safe_addstr(stdscr, y, 4, f"{pkg:<18}: {ver}", c_ok if ver != "MISSING" else c_err)
+            y += 1
+
+        # Section 2: base-devel Toolchain
+        safe_addstr(stdscr, 10, 2, "[ BASE-DEVEL & AUR BUILD TOOLCHAIN ]", c_title)
+        tc_ok = len(tc["missing"]) == 0
+        tc_summary = (
+            f"All {len(BUILD_BINS)} core build tools present ({', '.join(BUILD_BINS[:5])}...)"
+            if tc_ok
+            else f"Missing: {', '.join(tc['missing'])}"
+        )
+        safe_addstr(stdscr, 11, 4, f"Binaries          : {tc_summary}", c_ok if tc_ok else c_err)
+        safe_addstr(stdscr, 12, 4, f"Compiler          : {tc['gcc_ver']}")
+
+        # Section 3: Git Config
+        safe_addstr(stdscr, 14, 2, "[ GIT GLOBAL CONFIGURATION ]", c_title)
+        id_ok = git_s["name"] != "UNSET" and git_s["email"] != "UNSET"
+        safe_addstr(
+            stdscr,
+            15,
+            4,
+            f"Identity          : {git_s['name']} <{git_s['email']}>",
+            c_ok if id_ok else c_warn,
+        )
+        def_ok = git_s["branch"] != "UNSET" and git_s["editor"] != "UNSET"
+        safe_addstr(
+            stdscr,
+            16,
+            4,
+            f"Defaults          : init.defaultBranch={git_s['branch']} | core.editor={git_s['editor']}",
+            c_ok if def_ok else c_warn,
+        )
+
+        # Section 4: Zsh & Neovim Integration
+        safe_addstr(stdscr, 18, 2, "[ ZSH LOGIN SHELL & NEOVIM INTEGRATION ]", c_title)
+        safe_addstr(
+            stdscr,
+            19,
+            4,
+            f"Login Shell       : {sh_s['login_shell']} ({'Active Zsh' if sh_s['is_zsh'] else 'NOT ZSH'})",
+            c_ok if sh_s["is_zsh"] else c_err,
+        )
+        ed_ok = sh_s["editor_persisted"]
+        safe_addstr(
+            stdscr,
+            20,
+            4,
+            f"Default Editor    : Session={sh_s['env_editor']} | ~/.zshrc EDITOR=nvim: {'YES' if ed_ok else 'NO'}",
+            c_ok if ed_ok else c_warn,
+        )
+        safe_addstr(
+            stdscr,
+            21,
+            4,
+            f"Neovim Clipboard  : {'wl-clipboard ready (wl-copy/wl-paste)' if sh_s['wl_clip'] else 'wl-clipboard missing'}",
+            c_ok if sh_s["wl_clip"] else c_warn,
+        )
+
+        # Section 5: Actions
+        safe_addstr(stdscr, 23, 2, "[ ACTIONS ]", c_title)
+        safe_addstr(stdscr, 24, 4, "[1] Install Missing Base Tools (git, base-devel, neovim, zsh)")
+        safe_addstr(stdscr, 25, 4, "[2] Configure Git Identity & Defaults (defaultBranch=main, core.editor=nvim)")
+        safe_addstr(stdscr, 26, 4, "[3] Enforce Zsh Login Shell + Persist EDITOR=nvim in ~/.zshrc")
+        safe_addstr(stdscr, 27, 4, "[4] Run Neovim Clipboard & Provider Healthcheck   [r] Refresh   [q] Quit")
+
+        safe_addstr(stdscr, 29, 2, "-" * 78, curses.color_pair(1))
+        msg_col = (
+            c_err
+            if status_msg.startswith("ERROR")
+            else (c_ok if status_msg.startswith(("OK", "PASS")) else c_warn)
+        )
+        safe_addstr(stdscr, 30, 2, f"Status: {status_msg}", msg_col)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        elif ch in (ord("q"), ord("Q")):
+            break
+        elif ch == ord("1"):
+            status_msg = action_install_base_tools(stdscr)
+            refresh_all()
+        elif ch == ord("2"):
+            status_msg = action_configure_git(stdscr)
+            refresh_all()
+        elif ch == ord("3"):
+            status_msg = action_configure_zsh_and_editor(stdscr)
+            refresh_all()
+        elif ch == ord("4"):
+            status_msg = action_verify_neovim_health(stdscr)
+            refresh_all()
+        elif ch in (ord("r"), ord("R")):
+            refresh_all()
+            status_msg = "Refreshed base tools, Git, Zsh, and Neovim status."
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+import curses
+import glob
+import multiprocessing
+import os
+import subprocess
+import time
+
+SLEEP_TARGETS = [
+    "sleep.target",
+    "suspend.target",
+    "hibernate.target",
+    "hybrid-sleep.target",
+    "suspend-then-hibernate.target",
+]
+
+
+def _burn_worker(duration: float) -> None:
+    end = time.time() + duration
+    x = 1.0001
+    while time.time() < end:
+        x = (x * x) % 999983.0
+
+
+def read_file(path: str, default: str = "N/A") -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def get_cpu_stats() -> dict:
+    freq_files = glob.glob("/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq")
+    freqs = []
+    for f in freq_files:
+        val = read_file(f, "")
+        if val.isdigit():
+            freqs.append(int(val) // 1000)
+    freqs.sort(reverse=True)
+
+    govs = sorted({
+        read_file(f)
+        for f in glob.glob("/sys/devices/system/cpu/cpufreq/policy*/scaling_governor")
+    })
+    epps = sorted({
+        read_file(f)
+        for f in glob.glob("/sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference")
+    })
+
+    no_turbo = read_file("/sys/devices/system/cpu/intel_pstate/no_turbo", "?")
+    hwp_boost = read_file("/sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost", "?")
+
+    pkg_temp = "N/A"
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read_file(os.path.join(hw, "name")) == "coretemp":
+            raw = read_file(os.path.join(hw, "temp1_input"), "")
+            if raw.isdigit():
+                pkg_temp = f"{int(raw) // 1000} C"
+            break
+
+    return {
+        "peak_mhz": freqs[0] if freqs else 0,
+        "pcore_avg_mhz": sum(freqs[:8]) // max(1, len(freqs[:8])) if freqs else 0,
+        "min_mhz": freqs[-1] if freqs else 0,
+        "governor": ", ".join(govs) if govs else "N/A",
+        "epp": ", ".join(epps) if epps else "N/A",
+        "turbo": "Enabled" if no_turbo == "0" else f"Disabled ({no_turbo})",
+        "hwp_boost": hwp_boost,
+        "pkg_temp": pkg_temp,
+    }
+
+
+def get_profile() -> str:
+    try:
+        return subprocess.check_output(
+            ["powerprofilesctl", "get"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except Exception:
+        return "unavailable"
+
+
+def get_gpu_stats() -> dict:
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=pstate,power.draw,power.limit,temperature.gpu,persistence_mode",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        parts = [p.strip() for p in out.split(",")]
+        if len(parts) >= 5:
+            return {
+                "pstate": parts[0],
+                "power": f"{parts[1]} W / {parts[2]} W",
+                "temp": f"{parts[3]} C",
+                "persist": parts[4],
+            }
+    except Exception:
+        pass
+    return {"pstate": "N/A", "power": "N/A", "temp": "N/A", "persist": "N/A"}
+
+
+def get_sleep_audit() -> dict:
+    res = subprocess.run(
+        ["systemctl", "is-enabled", *SLEEP_TARGETS],
+        capture_output=True,
+        text=True,
+    )
+    states = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+    all_masked = len(states) == len(SLEEP_TARGETS) and all(s == "masked" for s in states)
+
+    lpmd_res = subprocess.run(
+        ["systemctl", "is-enabled", "intel_lpmd"], capture_output=True, text=True
+    )
+    lpmd_state = (lpmd_res.stdout or lpmd_res.stderr).strip().splitlines()[0]
+
+    persist_res = subprocess.run(
+        ["systemctl", "is-active", "nvidia-persistenced"], capture_output=True, text=True
+    )
+    persist_active = persist_res.stdout.strip() == "active"
+
+    logind_ok = os.path.exists("/etc/systemd/logind.conf.d/99-no-sleep.conf")
+
+    return {
+        "sleep_masked": all_masked,
+        "sleep_summary": "All Masked" if all_masked else ", ".join(set(states)),
+        "logind_ok": logind_ok,
+        "lpmd": lpmd_state,
+        "nv_persist_svc": persist_active,
+    }
+
+
+def run_sudo_cmd(stdscr, shell_cmd: str) -> int:
+    curses.def_prog_mode()
+    curses.endwin()
+    print("\n[power-mgr] Executing privileged configuration...\n")
+    proc = subprocess.run(["sudo", "bash", "-c", shell_cmd])
+    curses.reset_prog_mode()
+    stdscr.refresh()
+    return proc.returncode
+
+
+def auto_configure_dynamic(stdscr) -> str:
+    cmd = """
+    cpupower frequency-set -g powersave >/dev/null
+    sed -i "s/^#\\?governor=.*/governor='powersave'/" /etc/default/cpupower
+    grep -q "^governor='powersave'" /etc/default/cpupower || echo "governor='powersave'" >> /etc/default/cpupower
+    systemctl enable cpupower.service >/dev/null 2>&1
+    echo 1 > /sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost
+    echo "w /sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost - - - - 1" > /etc/tmpfiles.d/99-intel-hwp-boost.conf
+    systemctl restart power-profiles-daemon
+    """
+    rc = run_sudo_cmd(stdscr, cmd)
+    if rc != 0:
+        return "ERROR: Failed to apply dynamic CPU settings."
+    subprocess.run(["powerprofilesctl", "set", "balanced"], stderr=subprocess.DEVNULL)
+    return "OK: Dynamic scaling active (powersave + balanced + HWP boost persisted)."
+
+
+def enforce_no_sleep(stdscr) -> str:
+    targets = " ".join(SLEEP_TARGETS)
+    cmd = f"""
+    systemctl mask {targets} >/dev/null 2>&1
+    systemctl disable --now intel_lpmd >/dev/null 2>&1 || true
+    systemctl mask intel_lpmd >/dev/null 2>&1
+    mkdir -p /etc/systemd/logind.conf.d
+    printf "[Login]\\nHandleSuspendKey=ignore\\nHandleHibernateKey=ignore\\nHandleLidSwitch=ignore\\nIdleAction=ignore\\n" > /etc/systemd/logind.conf.d/99-no-sleep.conf
+    systemctl kill -s HUP systemd-logind
+    systemctl enable --now nvidia-persistenced.service >/dev/null 2>&1
+    """
+    rc = run_sudo_cmd(stdscr, cmd)
+    if rc != 0:
+        return "ERROR: Failed to apply no-sleep / persistence rules."
+    return "OK: Sleep/hibernate masked, logind locked, intel_lpmd masked, GPU persistence on."
+
+
+def set_profile_smart(stdscr, target: str) -> str:
+    cpu = get_cpu_stats()
+    if target in ("balanced", "power-saver") and "performance" in cpu["governor"]:
+        cmd = """
+        cpupower frequency-set -g powersave >/dev/null
+        systemctl restart power-profiles-daemon
+        """
+        if run_sudo_cmd(stdscr, cmd) != 0:
+            return "ERROR: Could not unlock intel_pstate governor to powersave."
+    res = subprocess.run(
+        ["powerprofilesctl", "set", target], capture_output=True, text=True
+    )
+    if res.returncode != 0:
+        return f"ERROR: {res.stderr.strip()}"
+    return f"OK: Active profile switched to '{target}'."
+
+
+def toggle_hwp_boost(stdscr) -> str:
+    cur = read_file("/sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost", "0")
+    nxt = "0" if cur == "1" else "1"
+    cmd = f"""
+    echo {nxt} > /sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost
+    echo "w /sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost - - - - {nxt}" > /etc/tmpfiles.d/99-intel-hwp-boost.conf
+    """
+    if run_sudo_cmd(stdscr, cmd) != 0:
+        return "ERROR: Could not toggle hwp_dynamic_boost."
+    return f"OK: hwp_dynamic_boost set to {nxt} and persisted."
+
+
+def run_boost_test(stdscr, draw_fn) -> str:
+    idle_before = get_cpu_stats()["pcore_avg_mhz"]
+    peak_seen = 0
+
+    with multiprocessing.Pool(processes=8) as pool:
+        async_res = pool.map_async(_burn_worker, [3.5] * 8)
+        start = time.time()
+        while not async_res.ready() and (time.time() - start) < 4.5:
+            stats = get_cpu_stats()
+            if stats["peak_mhz"] > peak_seen:
+                peak_seen = stats["peak_mhz"]
+            draw_fn(f"TESTING: Burning 8 P-cores... Peak so far: {peak_seen} MHz")
+            time.sleep(0.25)
+
+    for _ in range(8):
+        stats = get_cpu_stats()
+        draw_fn(f"TESTING: Waiting for idle drop... Current P-core avg: {stats['pcore_avg_mhz']} MHz")
+        time.sleep(0.3)
+
+    idle_after = get_cpu_stats()["pcore_avg_mhz"]
+    if peak_seen >= 5000 and idle_after < 2600:
+        return (
+            f"PASS: Idle {idle_before} MHz -> Peak {peak_seen} MHz -> Recovered {idle_after} MHz"
+        )
+    return (
+        f"CHECK: Idle {idle_before} MHz -> Peak {peak_seen} MHz -> Post-load {idle_after} MHz"
+    )
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    try:
+        win.addstr(y, x, text[: max_x - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.timeout(500)
+
+    status_msg = "Ready. Press [1] for Dynamic Auto-Config, [2] for No-Sleep Lock, [3] to Test Boost."
+    gpu_cache = get_gpu_stats()
+    audit_cache = get_sleep_audit()
+    last_slow_poll = time.time()
+
+    def draw(override_status: str = "") -> None:
+        nonlocal gpu_cache, audit_cache, last_slow_poll
+        now = time.time()
+        if now - last_slow_poll >= 3.0:
+            gpu_cache = get_gpu_stats()
+            audit_cache = get_sleep_audit()
+            last_slow_poll = now
+
+        cpu = get_cpu_stats()
+        profile = get_profile()
+        msg = override_status or status_msg
+
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        c_ok = curses.color_pair(2) | curses.A_BOLD
+        c_warn = curses.color_pair(3) | curses.A_BOLD
+        c_err = curses.color_pair(4) | curses.A_BOLD
+
+        safe_addstr(stdscr, 1, 2, "razorbillOS // CachyOS Power & Boost Manager (i9-13900F + RTX 4090)", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 72, curses.color_pair(1))
+
+        # CPU Section
+        safe_addstr(stdscr, 4, 2, "[ CPU & SCALING ]", c_title)
+        prof_color = c_ok if profile in ("balanced", "performance") else c_warn
+        safe_addstr(stdscr, 5, 4, f"Active Profile    : {profile}", prof_color)
+        safe_addstr(stdscr, 6, 4, f"Governor / EPP    : {cpu['governor']}  |  {cpu['epp']}")
+        safe_addstr(stdscr, 7, 4, f"Turbo / HWP Boost : {cpu['turbo']}  |  HWP Dynamic Boost: {cpu['hwp_boost']}")
+        freq_color = c_warn if cpu["peak_mhz"] >= 4800 else c_ok
+        safe_addstr(
+            stdscr,
+            8,
+            4,
+            f"Live Clocks       : Peak {cpu['peak_mhz']} MHz  |  P-Core Avg {cpu['pcore_avg_mhz']} MHz  |  Min {cpu['min_mhz']} MHz",
+            freq_color,
+        )
+        safe_addstr(stdscr, 9, 4, f"CPU Package Temp  : {cpu['pkg_temp']}")
+
+        # GPU Section
+        safe_addstr(stdscr, 11, 2, "[ NVIDIA RTX 4090 ]", c_title)
+        safe_addstr(
+            stdscr,
+            12,
+            4,
+            f"State & Power     : {gpu_cache['pstate']}  |  {gpu_cache['power']}  |  Temp: {gpu_cache['temp']}",
+        )
+        p_color = c_ok if gpu_cache["persist"] == "Enabled" else c_warn
+        safe_addstr(stdscr, 13, 4, f"Persistence Mode  : {gpu_cache['persist']}", p_color)
+
+        # Sleep / Hibernate Audit
+        safe_addstr(stdscr, 15, 2, "[ SLEEP / HIBERNATE / DAEMON AUDIT ]", c_title)
+        s_color = c_ok if audit_cache["sleep_masked"] else c_err
+        safe_addstr(stdscr, 16, 4, f"Systemd Sleep     : {audit_cache['sleep_summary']}", s_color)
+        l_color = c_ok if audit_cache["logind_ok"] else c_warn
+        safe_addstr(
+            stdscr,
+            17,
+            4,
+            f"Logind No-Sleep   : {'Configured (99-no-sleep.conf)' if audit_cache['logind_ok'] else 'Not Configured'}",
+            l_color,
+        )
+        lp_color = c_ok if audit_cache["lpmd"] in ("masked", "disabled") else c_warn
+        safe_addstr(stdscr, 18, 4, f"intel_lpmd        : {audit_cache['lpmd']}", lp_color)
+
+        # Controls
+        safe_addstr(stdscr, 20, 2, "[ ACTIONS ]", c_title)
+        safe_addstr(stdscr, 21, 4, "[1] Auto-Configure Dynamic Scaling (Idle ~1.4GHz -> 5.6GHz Burst + Persist)")
+        safe_addstr(stdscr, 22, 4, "[2] Enforce No-Sleep / No-Hibernate + GPU Persistence")
+        safe_addstr(stdscr, 23, 4, "[3] Run Live 100% Turbo Boost & Idle Recovery Test")
+        safe_addstr(stdscr, 24, 4, "[b] Balanced Profile   [p] Performance Profile   [d] Toggle HWP Boost   [q] Quit")
+
+        safe_addstr(stdscr, 26, 2, "-" * 72, curses.color_pair(1))
+        msg_color = c_err if msg.startswith("ERROR") else (c_ok if msg.startswith(("OK", "PASS")) else c_warn)
+        safe_addstr(stdscr, 27, 2, f"Status: {msg}", msg_color)
+        stdscr.refresh()
+
+    while True:
+        draw()
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        elif ch in (ord("q"), ord("Q")):
+            break
+        elif ch == ord("1"):
+            status_msg = auto_configure_dynamic(stdscr)
+            last_slow_poll = 0
+        elif ch == ord("2"):
+            status_msg = enforce_no_sleep(stdscr)
+            last_slow_poll = 0
+        elif ch == ord("3"):
+            status_msg = run_boost_test(stdscr, draw)
+        elif ch in (ord("b"), ord("B")):
+            status_msg = set_profile_smart(stdscr, "balanced")
+        elif ch in (ord("p"), ord("P")):
+            status_msg = set_profile_smart(stdscr, "performance")
+        elif ch in (ord("d"), ord("D")):
+            status_msg = toggle_hwp_boost(stdscr)
+        elif ch in (ord("r"), ord("R")):
+            last_slow_poll = 0
+            status_msg = "Refreshed all hardware sensors."
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

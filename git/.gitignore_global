@@ -1,0 +1,13 @@
+# OS & Thumbnails
+.DS_Store
+Thumbs.db
+# Editors & Swap
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+# Local Env & Tooling
+.direnv/
+.env.local
+__pycache__/

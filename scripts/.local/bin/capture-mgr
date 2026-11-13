@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+import curses
+import os
+import re
+import shutil
+import subprocess
+import time
+
+REQUIRED_PKGS = [
+    "grim",
+    "slurp",
+    "wl-clipboard",
+    "cliphist",
+    "xdg-desktop-portal-hyprland",
+]
+
+KEYBINDS_PATH = os.path.expanduser("~/.config/hypr/modules/keybinds.lua")
+AUTOSTART_PATH = os.path.expanduser("~/.config/hypr/modules/autostart.lua")
+
+
+def run_cmd(args: list[str], timeout: int = 8) -> tuple[int, str, str]:
+    try:
+        res = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def get_pkg_status() -> dict[str, str]:
+    status = {}
+    for pkg in REQUIRED_PKGS:
+        rc, out, _ = run_cmd(["pacman", "-Q", pkg])
+        parts = out.split()
+        status[pkg] = parts[1] if rc == 0 and len(parts) >= 2 else "MISSING"
+    return status
+
+
+def get_clipboard_status() -> dict:
+    _, pgrep_out, _ = run_cmd(["pgrep", "-af", "wl-paste.*cliphist"])
+    text_watch = "--type text" in pgrep_out
+    img_watch = "--type image" in pgrep_out
+
+    rc_clip, clip_out, _ = run_cmd(["cliphist", "list"])
+    entries = [line for line in clip_out.splitlines() if line.strip()] if rc_clip == 0 else []
+
+    rc_mime, mime_out, _ = run_cmd(["wl-paste", "--list-types"], timeout=2)
+    mimes = [m.strip() for m in mime_out.splitlines() if m.strip()] if rc_mime == 0 else []
+
+    autostart_ok = False
+    if os.path.exists(AUTOSTART_PATH):
+        with open(AUTOSTART_PATH, "r", encoding="utf-8") as f:
+            autostart_ok = "cliphist store" in f.read()
+
+    return {
+        "text_watch": text_watch,
+        "img_watch": img_watch,
+        "count": len(entries),
+        "latest": entries[0][:52] if entries else "Empty",
+        "mimes": ", ".join(mimes[:4]) if mimes else "None",
+        "autostart_ok": autostart_ok,
+    }
+
+
+def get_keybind_status() -> dict:
+    if not os.path.exists(KEYBINDS_PATH):
+        return {"configured": False, "line": "keybinds.lua not found"}
+
+    with open(KEYBINDS_PATH, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    active_s_binds = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("--"):
+            continue
+        if "SHIFT" in stripped and (
+            '"S"' in stripped or "'S'" in stripped or ", S," in stripped or ",S," in stripped
+        ):
+            active_s_binds.append(stripped)
+
+    has_grim = any("grim" in b and "wl-copy" in b for b in active_s_binds)
+    summary = active_s_binds[0][:62] if active_s_binds else "Unbound"
+    return {
+        "configured": has_grim,
+        "line": summary,
+    }
+
+
+def get_screenshare_status() -> dict:
+    _, p_portal, _ = run_cmd(["systemctl", "--user", "is-active", "xdg-desktop-portal-hyprland"])
+    _, p_pw, _ = run_cmd(["systemctl", "--user", "is-active", "pipewire"])
+    _, p_wp, _ = run_cmd(["systemctl", "--user", "is-active", "wireplumber"])
+    _, mon_out, _ = run_cmd(["hyprctl", "monitors"])
+
+    mon_summary = "Unknown"
+    for line in mon_out.splitlines():
+        s = line.strip()
+        if s.startswith("Monitor "):
+            mon_summary = s.split("(")[0].replace("Monitor ", "").strip()
+        elif "@" in s and "x" in s and "at" in s:
+            mon_summary += f" ({s.split(' at ')[0].strip()})"
+            break
+
+    return {
+        "portal_hypr": p_portal.splitlines()[0] if p_portal else "inactive",
+        "pipewire": p_pw.splitlines()[0] if p_pw else "inactive",
+        "wireplumber": p_wp.splitlines()[0] if p_wp else "inactive",
+        "monitor": mon_summary,
+    }
+
+
+def run_interactive_cmd(stdscr, cmd: list[str], banner: str) -> int:
+    curses.def_prog_mode()
+    curses.endwin()
+    print(f"\n[capture-mgr] {banner}\n")
+    proc = subprocess.run(cmd)
+    curses.reset_prog_mode()
+    stdscr.refresh()
+    return proc.returncode
+
+
+def start_clipboard_watchers() -> None:
+    _, pgrep_out, _ = run_cmd(["pgrep", "-af", "wl-paste.*cliphist"])
+    if "--type text" not in pgrep_out:
+        subprocess.Popen(
+            ["wl-paste", "--type", "text", "--watch", "cliphist", "store"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    if "--type image" not in pgrep_out:
+        subprocess.Popen(
+            ["wl-paste", "--type", "image", "--watch", "cliphist", "store"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def action_install_and_wire_clipboard(stdscr) -> str:
+    pkgs = get_pkg_status()
+    missing = [p for p, v in pkgs.items() if v == "MISSING"]
+    if missing:
+        rc = run_interactive_cmd(
+            stdscr,
+            ["sudo", "pacman", "-S", "--needed", *missing],
+            f"Installing missing packages: {' '.join(missing)}...",
+        )
+        if rc != 0:
+            return "ERROR: pacman failed to install required packages."
+
+    start_clipboard_watchers()
+
+    if os.path.exists(AUTOSTART_PATH):
+        with open(AUTOSTART_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        if "cliphist store" not in content:
+            with open(AUTOSTART_PATH, "a", encoding="utf-8") as f:
+                f.write(
+                    '\nhl.on("hyprland.start", function ()\n'
+                    '    hl.exec_cmd("wl-paste --type text --watch cliphist store")\n'
+                    '    hl.exec_cmd("wl-paste --type image --watch cliphist store")\n'
+                    "end)\n"
+                )
+
+    rc_reload, out_reload, _ = run_cmd(["hyprctl", "reload"])
+    if rc_reload != 0 or out_reload != "ok":
+        return f"WARN: Daemons started, but hyprctl reload returned: {out_reload}"
+
+    time.sleep(0.3)
+    return "OK: Packages installed, cliphist watchers running, and autostart.lua updated."
+
+
+def action_bind_screenshot_hotkey() -> str:
+    if not os.path.exists(KEYBINDS_PATH):
+        return f"ERROR: {KEYBINDS_PATH} does not exist."
+
+    backup_path = KEYBINDS_PATH + ".bak"
+    shutil.copy2(KEYBINDS_PATH, backup_path)
+
+    with open(KEYBINDS_PATH, "r", encoding="utf-8") as f:
+        raw_lines = f.readlines()
+
+    full_text = "".join(raw_lines)
+    new_lines = []
+    for line in raw_lines:
+        stripped = line.strip()
+        if (
+            stripped
+            and not stripped.startswith("--")
+            and "SHIFT" in stripped
+            and ('"S"' in stripped or "'S'" in stripped or ", S," in stripped or ",S," in stripped)
+            and "grim" not in stripped
+        ):
+            new_lines.append("-- [Replaced by capture-mgr] " + line)
+        else:
+            new_lines.append(line)
+
+    if any("grim" in l and "wl-copy" in l and not l.strip().startswith("--") for l in new_lines):
+        return "OK: SUPER + SHIFT + S region-to-clipboard bind is already active."
+
+    # Match existing Hyprland Lua keybind style
+    if "mainMod" in full_text:
+        bind_stmt = '\nhl.bind(mainMod .. " + SHIFT + S", hl.dsp.exec_cmd(\'grim -g "$(slurp)" - | wl-copy --type image/png\'))\n'
+    elif re.search(r'hl\.bind\s*\(\s*\{', full_text):
+        bind_stmt = (
+            '\nhl.bind({ "SUPER", "SHIFT" }, "S", function ()\n'
+            '    hl.exec_cmd(\'grim -g "$(slurp)" - | wl-copy --type image/png\')\n'
+            "end)\n"
+        )
+    elif re.search(r'hl\.bind\s*\(\s*["\']', full_text):
+        bind_stmt = '\nhl.bind(\'SUPER SHIFT, S, exec, grim -g "$(slurp)" - | wl-copy --type image/png\')\n'
+    elif "bind" in full_text and "hl.config" in full_text:
+        bind_stmt = (
+            '\nhl.bind({ "SUPER", "SHIFT" }, "S", function ()\n'
+            '    hl.exec_cmd(\'grim -g "$(slurp)" - | wl-copy --type image/png\')\n'
+            "end)\n"
+        )
+    else:
+        bind_stmt = (
+            '\nhl.bind({ "SUPER", "SHIFT" }, "S", function ()\n'
+            '    hl.exec_cmd(\'grim -g "$(slurp)" - | wl-copy --type image/png\')\n'
+            "end)\n"
+        )
+
+    new_lines.append(bind_stmt)
+    with open(KEYBINDS_PATH, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    rc, out, err = run_cmd(["hyprctl", "reload"])
+    if rc != 0 or out != "ok":
+        shutil.copy2(backup_path, KEYBINDS_PATH)
+        run_cmd(["hyprctl", "reload"])
+        return f"ERROR: Lua syntax rejected ({out or err}); restored keybinds.lua.bak."
+
+    return "OK: Bound SUPER + SHIFT + S to region capture -> clipboard (hyprctl reload: ok)."
+
+
+def action_test_region_screenshot() -> str:
+    rc, _, err = run_cmd(
+        ["bash", "-c", 'grim -g "$(slurp)" - | wl-copy --type image/png'],
+        timeout=30,
+    )
+    if rc != 0:
+        return f"CANCELLED/FAIL: Region capture aborted ({err or 'Esc pressed'})."
+
+    time.sleep(0.25)
+    _, mime_out, _ = run_cmd(["wl-paste", "--list-types"], timeout=3)
+    _, clip_out, _ = run_cmd(["cliphist", "list"], timeout=3)
+    first_entry = clip_out.splitlines()[0] if clip_out.splitlines() else ""
+
+    if "image/png" in mime_out:
+        return f"PASS: Region copied to clipboard (image/png) | cliphist: {first_entry[:36]}"
+    return f"WARN: Capture ran, but clipboard MIME is '{mime_out.strip()}'."
+
+
+def action_test_screenshare() -> str:
+    rc, out, err = run_cmd([
+        "gdbus", "call", "--session",
+        "--dest", "org.freedesktop.portal.Desktop",
+        "--object-path", "/org/freedesktop/portal/desktop",
+        "--method", "org.freedesktop.portal.ScreenCast.CreateSession",
+        "{'session_handle_token': <'capture_mgr_verify'>}",
+    ], timeout=8)
+    if rc == 0 and "/org/freedesktop/portal/desktop/request/" in out:
+        return "PASS: PipeWire ScreenCast portal session negotiated cleanly."
+    return f"FAIL: ScreenCast portal error: {err or out}"
+
+
+def action_wipe_clipboard() -> str:
+    run_cmd(["wl-copy", "--clear"])
+    rc, _, err = run_cmd(["cliphist", "wipe"])
+    if rc != 0:
+        return f"ERROR: cliphist wipe failed: {err}"
+    return "OK: Clipboard and cliphist history wiped."
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    try:
+        win.addstr(y, x, text[: max_x - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)
+
+    status_msg = "Ready. Press [1] Install/Wire Clipboard, [2] Bind SUPER+SHIFT+S, [3] Test Capture."
+    pkgs = get_pkg_status()
+    clip = get_clipboard_status()
+    kb = get_keybind_status()
+    ss = get_screenshare_status()
+    last_poll = time.time()
+
+    def refresh_all() -> None:
+        nonlocal pkgs, clip, kb, ss, last_poll
+        pkgs = get_pkg_status()
+        clip = get_clipboard_status()
+        kb = get_keybind_status()
+        ss = get_screenshare_status()
+        last_poll = time.time()
+
+    while True:
+        if time.time() - last_poll >= 2.5:
+            refresh_all()
+
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        c_ok = curses.color_pair(2) | curses.A_BOLD
+        c_warn = curses.color_pair(3) | curses.A_BOLD
+        c_err = curses.color_pair(4) | curses.A_BOLD
+
+        safe_addstr(stdscr, 1, 2, "razorbillOS // Screenshot, Clipboard & Screen Share Manager", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 76, curses.color_pair(1))
+
+        # Packages
+        safe_addstr(stdscr, 4, 2, "[ PACKAGES ]", c_title)
+        y = 5
+        for pkg in REQUIRED_PKGS:
+            ver = pkgs.get(pkg, "MISSING")
+            safe_addstr(stdscr, y, 4, f"{pkg:<30}: {ver}", c_ok if ver != "MISSING" else c_err)
+            y += 1
+
+        # Clipboard & Daemons
+        safe_addstr(stdscr, 11, 2, "[ WAYLAND CLIPBOARD & CLIPHIST DAEMONS ]", c_title)
+        w_ok = clip["text_watch"] and clip["img_watch"]
+        w_str = f"Text Watcher: {'ON' if clip['text_watch'] else 'OFF'}  |  Image Watcher: {'ON' if clip['img_watch'] else 'OFF'}"
+        safe_addstr(stdscr, 12, 4, f"Live Watchers     : {w_str}", c_ok if w_ok else c_err)
+        safe_addstr(
+            stdscr,
+            13,
+            4,
+            f"Autostart Lua     : {'Configured (autostart.lua)' if clip['autostart_ok'] else 'Not Configured'}",
+            c_ok if clip["autostart_ok"] else c_warn,
+        )
+        safe_addstr(stdscr, 14, 4, f"Current MIME      : {clip['mimes']}")
+        safe_addstr(stdscr, 15, 4, f"History ({clip['count']} items): {clip['latest']}")
+
+        # Hotkey
+        safe_addstr(stdscr, 17, 2, "[ HYPRLAND HOTKEY (SUPER + SHIFT + S) ]", c_title)
+        safe_addstr(
+            stdscr,
+            18,
+            4,
+            f"Status            : {'ACTIVE (Region -> Clipboard)' if kb['configured'] else 'NOT SET FOR SCREENSHOT'}",
+            c_ok if kb["configured"] else c_warn,
+        )
+        safe_addstr(stdscr, 19, 4, f"keybinds.lua      : {kb['line']}")
+
+        # Screen Sharing
+        safe_addstr(stdscr, 21, 2, "[ SCREEN SHARING PIPELINE ]", c_title)
+        ss_ok = ss["portal_hypr"] == "active" and ss["pipewire"] == "active"
+        safe_addstr(
+            stdscr,
+            22,
+            4,
+            f"Daemons           : portal-hyprland={ss['portal_hypr']} | pipewire={ss['pipewire']} | wireplumber={ss['wireplumber']}",
+            c_ok if ss_ok else c_err,
+        )
+        safe_addstr(stdscr, 23, 4, f"Capture Target    : {ss['monitor']}")
+
+        # Actions
+        safe_addstr(stdscr, 25, 2, "[ ACTIONS ]", c_title)
+        safe_addstr(stdscr, 26, 4, "[1] Install grim/slurp/wl-clipboard/cliphist + Start & Persist Watchers")
+        safe_addstr(stdscr, 27, 4, "[2] Bind SUPER + SHIFT + S -> Region Screenshot to Clipboard (keybinds.lua)")
+        safe_addstr(stdscr, 28, 4, "[3] Test Region Capture -> Clipboard Now (Drag Box with Mouse)")
+        safe_addstr(stdscr, 29, 4, "[4] Test PipeWire ScreenCast Session   [w] Wipe Clipboard   [r] Refresh   [q] Quit")
+
+        safe_addstr(stdscr, 31, 2, "-" * 76, curses.color_pair(1))
+        msg_col = (
+            c_err
+            if status_msg.startswith(("ERROR", "FAIL", "CANCELLED"))
+            else (c_ok if status_msg.startswith(("OK", "PASS")) else c_warn)
+        )
+        safe_addstr(stdscr, 32, 2, f"Status: {status_msg}", msg_col)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        elif ch in (ord("q"), ord("Q")):
+            break
+        elif ch == ord("1"):
+            status_msg = action_install_and_wire_clipboard(stdscr)
+            refresh_all()
+        elif ch == ord("2"):
+            status_msg = action_bind_screenshot_hotkey()
+            refresh_all()
+        elif ch == ord("3"):
+            status_msg = action_test_region_screenshot()
+            refresh_all()
+        elif ch == ord("4"):
+            status_msg = action_test_screenshare()
+            refresh_all()
+        elif ch in (ord("w"), ord("W")):
+            status_msg = action_wipe_clipboard()
+            refresh_all()
+        elif ch in (ord("r"), ord("R")):
+            refresh_all()
+            status_msg = "Refreshed capture, clipboard, and screen-share state."
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

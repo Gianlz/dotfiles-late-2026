@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+import curses
+import glob
+import multiprocessing
+import os
+import subprocess
+import time
+
+
+def run_cmd(args: list[str], timeout: int = 5) -> tuple[int, str, str]:
+    try:
+        res = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def read_file(path: str, default: str = "") -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+def get_cpu_thermals() -> dict:
+    pkg_temp = None
+    core_temps = []
+    tjmax = 100.0
+
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        name = read_file(os.path.join(hw, "name"))
+        if name != "coretemp":
+            continue
+        crit_raw = read_file(os.path.join(hw, "temp1_crit"))
+        if crit_raw.isdigit():
+            tjmax = int(crit_raw) / 1000.0
+
+        for t_in in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
+            val_raw = read_file(t_in)
+            if not val_raw.isdigit():
+                continue
+            temp_c = int(val_raw) / 1000.0
+            lbl_path = t_in.replace("_input", "_label")
+            lbl = read_file(lbl_path)
+            if "Package" in lbl:
+                pkg_temp = temp_c
+            else:
+                core_temps.append(temp_c)
+
+    if pkg_temp is None and core_temps:
+        pkg_temp = max(core_temps)
+
+    peak_core = max(core_temps) if core_temps else (pkg_temp or 0.0)
+
+    pkg_throttle = 0
+    raw_pkg_th = read_file("/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count")
+    if raw_pkg_th.isdigit():
+        pkg_throttle = int(raw_pkg_th)
+
+    core_throttle = 0
+    for c_th in glob.glob("/sys/devices/system/cpu/cpu*/thermal_throttle/core_throttle_count"):
+        v = read_file(c_th)
+        if v.isdigit():
+            core_throttle += int(v)
+
+    return {
+        "pkg_temp": pkg_temp if pkg_temp is not None else 0.0,
+        "peak_core": peak_core,
+        "tjmax": tjmax,
+        "pkg_throttle": pkg_throttle,
+        "core_throttle": core_throttle,
+    }
+
+
+def read_rapl_energy() -> tuple[int | None, float]:
+    raw = read_file("/sys/class/powercap/intel-rapl:0/energy_uj")
+    if raw.isdigit():
+        return int(raw), time.monotonic()
+    return None, time.monotonic()
+
+
+def get_gpu_thermals() -> dict:
+    rc, out, _ = run_cmd([
+        "nvidia-smi",
+        "--query-gpu=temperature.gpu,fan.speed,power.draw,power.limit,clocks.gr",
+        "--format=csv,noheader,nounits",
+    ])
+    temp_c = 0.0
+    fan_pct = 0
+    pwr_draw = 0.0
+    pwr_limit = 450.0
+    clk_gr = 0
+
+    if rc == 0 and out:
+        parts = [p.strip() for p in out.splitlines()[0].split(",")]
+        if len(parts) >= 5:
+            try:
+                temp_c = float(parts[0])
+            except ValueError:
+                pass
+            try:
+                fan_pct = int(float(parts[1]))
+            except ValueError:
+                pass
+            try:
+                pwr_draw = float(parts[2])
+            except ValueError:
+                pass
+            try:
+                pwr_limit = float(parts[3])
+            except ValueError:
+                pass
+            try:
+                clk_gr = int(float(parts[4]))
+            except ValueError:
+                pass
+
+    slowdown = "None"
+    rc_q, q_out, _ = run_cmd(["nvidia-smi", "-q", "-d", "PERFORMANCE"])
+    if rc_q == 0:
+        for line in q_out.splitlines():
+            s = line.strip()
+            if ("HW Thermal Slowdown" in s or "SW Thermal Slowdown" in s) and s.endswith(": Active"):
+                slowdown = s.split(":")[0].strip()
+                break
+
+    return {
+        "temp_c": temp_c,
+        "fan_pct": fan_pct,
+        "pwr_draw": pwr_draw,
+        "pwr_limit": pwr_limit,
+        "clk_gr": clk_gr,
+        "slowdown": slowdown,
+    }
+
+
+def get_hwmon_fans_and_nvme() -> tuple[list[dict], list[dict]]:
+    fans = []
+    nvmes = []
+    pwm_modes = {"0": "Full", "1": "Manual", "2": "Auto/BIOS", "3": "Auto/BIOS", "5": "Auto/BIOS"}
+
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        chip = read_file(os.path.join(hw, "name"), os.path.basename(hw))
+
+        for f_in in sorted(glob.glob(os.path.join(hw, "fan*_input"))):
+            rpm_raw = read_file(f_in)
+            if not rpm_raw.isdigit():
+                continue
+            rpm = int(rpm_raw)
+            base = os.path.basename(f_in).replace("_input", "")
+            lbl = read_file(os.path.join(hw, f"{base}_label"), base)
+            pwm_idx = base.replace("fan", "pwm")
+            pwm_en = read_file(os.path.join(hw, f"{pwm_idx}_enable"))
+            pwm_val = read_file(os.path.join(hw, pwm_idx))
+            mode_str = pwm_modes.get(pwm_en, "Hardware")
+            if pwm_val.isdigit():
+                pct = round(int(pwm_val) * 100 / 255)
+                mode_str = f"{mode_str} {pct}%"
+            fans.append({
+                "chip": chip,
+                "label": lbl,
+                "rpm": rpm,
+                "mode": mode_str,
+            })
+
+        if chip == "nvme":
+            t_raw = read_file(os.path.join(hw, "temp1_input"))
+            if t_raw.isdigit():
+                nvmes.append({
+                    "label": read_file(os.path.join(hw, "temp1_label"), "NVMe"),
+                    "temp_c": int(t_raw) / 1000.0,
+                })
+
+    return fans, nvmes
+
+
+def run_interactive_cmd(stdscr, cmd: list[str], banner: str) -> int:
+    curses.def_prog_mode()
+    curses.endwin()
+    print(f"\n[thermal-mgr] {banner}\n")
+    proc = subprocess.run(cmd)
+    curses.reset_prog_mode()
+    stdscr.refresh()
+    return proc.returncode
+
+
+def action_probe_sensors(stdscr) -> str:
+    rc = run_interactive_cmd(
+        stdscr,
+        [
+            "sudo",
+            "bash",
+            "-c",
+            "pacman -S --needed --noconfirm lm_sensors stress-ng && sensors-detect --auto",
+        ],
+        "Installing lm_sensors + stress-ng and probing Super I/O fan/temp modules...",
+    )
+    if rc != 0:
+        return "ERROR: Failed installing or probing sensors."
+    return "OK: lm_sensors + stress-ng installed and hardware sensor modules probed."
+
+
+def _burn_worker(stop_evt) -> None:
+    x = 1.0001
+    while not stop_evt.is_set():
+        x = (x * 1.000001) % 99991.0
+
+
+def action_cpu_load_test(stdscr, peaks: dict) -> str:
+    cpu0 = get_cpu_thermals()
+    fans0, _ = get_hwmon_fans_and_nvme()
+    idle_rpms = [f["rpm"] for f in fans0 if f["rpm"] > 0]
+    idle_max_rpm = max(idle_rpms) if idle_rpms else 0
+
+    has_stress = subprocess.run(["which", "stress-ng"], capture_output=True).returncode == 0
+    proc = None
+    stop_evt = None
+    workers = []
+
+    if has_stress:
+        proc = subprocess.Popen(
+            ["stress-ng", "--cpu", "0", "--timeout", "20s", "--quiet"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        stop_evt = multiprocessing.Event()
+        n_workers = max(1, (os.cpu_count() or 8))
+        for _ in range(n_workers):
+            p = multiprocessing.Process(target=_burn_worker, args=(stop_evt,), daemon=True)
+            p.start()
+            workers.append(p)
+
+    max_cpu_c = cpu0["pkg_temp"]
+    max_rpm = idle_max_rpm
+    start_t = time.monotonic()
+
+    try:
+        while time.monotonic() - start_t < 20.0:
+            rem = int(20.0 - (time.monotonic() - start_t))
+            c_now = get_cpu_thermals()
+            g_now = get_gpu_thermals()
+            f_now, _ = get_hwmon_fans_and_nvme()
+            rpms = [f["rpm"] for f in f_now if f["rpm"] > 0]
+            cur_max_rpm = max(rpms) if rpms else 0
+
+            max_cpu_c = max(max_cpu_c, c_now["pkg_temp"], c_now["peak_core"])
+            max_rpm = max(max_rpm, cur_max_rpm)
+            peaks["cpu_c"] = max(peaks["cpu_c"], max_cpu_c)
+            peaks["fan_rpm"] = max(peaks["fan_rpm"], max_rpm)
+
+            stdscr.erase()
+            c_title = curses.color_pair(1) | curses.A_BOLD
+            c_warn = curses.color_pair(3) | curses.A_BOLD
+            safe_addstr(stdscr, 1, 2, "razorbillOS // LIVE 20s CPU THERMAL & FAN CURVE STRESS TEST", c_title)
+            safe_addstr(stdscr, 2, 2, "=" * 76, curses.color_pair(1))
+            safe_addstr(stdscr, 4, 4, f"Remaining Time   : {rem}s  (100% All-Core Load Active)", c_warn)
+            safe_addstr(stdscr, 6, 4, f"Live CPU Pkg Temp: {c_now['pkg_temp']:.1f}°C  |  Peak Recorded: {max_cpu_c:.1f}°C / {c_now['tjmax']:.0f}°C")
+            safe_addstr(stdscr, 7, 4, f"Live GPU Temp    : {g_now['temp_c']:.0f}°C  |  GPU Fan: {g_now['fan_pct']}%")
+            safe_addstr(stdscr, 8, 4, f"Fan RPM Ramp     : Idle Baseline {idle_max_rpm} RPM -> Peak {max_rpm} RPM")
+            th_delta = (c_now["pkg_throttle"] - cpu0["pkg_throttle"]) + (c_now["core_throttle"] - cpu0["core_throttle"])
+            safe_addstr(stdscr, 9, 4, f"Throttle Events  : +{th_delta} during test")
+            stdscr.refresh()
+            time.sleep(0.5)
+    finally:
+        if proc is not None:
+            proc.terminate()
+            proc.wait(timeout=3)
+        if stop_evt is not None:
+            stop_evt.set()
+            for w in workers:
+                w.join(timeout=1)
+
+    cpu_end = get_cpu_thermals()
+    th_total = (cpu_end["pkg_throttle"] - cpu0["pkg_throttle"]) + (cpu_end["core_throttle"] - cpu0["core_throttle"])
+
+    if th_total > 0 or max_cpu_c >= 98.0:
+        return f"WARN: Peak {max_cpu_c:.1f}°C with {th_total} throttle events (Fan max: {max_rpm} RPM). Check cooler/curve."
+    if idle_max_rpm > 0 and max_rpm <= idle_max_rpm + 40 and max_cpu_c > 75.0:
+        return f"WARN: Peak {max_cpu_c:.1f}°C, 0 throttles, but fan RPM barely moved ({idle_max_rpm} -> {max_rpm} RPM)."
+    return f"PASS: CPU Peak {max_cpu_c:.1f}°C, 0 throttles, Fans ramped {idle_max_rpm} -> {max_rpm} RPM."
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    try:
+        win.addstr(y, x, text[: max_x - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)
+
+    cpu = get_cpu_thermals()
+    gpu = get_gpu_thermals()
+    fans, nvmes = get_hwmon_fans_and_nvme()
+    active_rpms = [f["rpm"] for f in fans if f["rpm"] > 0]
+
+    peaks = {
+        "cpu_c": max(cpu["pkg_temp"], cpu["peak_core"]),
+        "gpu_c": gpu["temp_c"],
+        "gpu_w": gpu["pwr_draw"],
+        "gpu_fan": gpu["fan_pct"],
+        "fan_rpm": max(active_rpms) if active_rpms else 0,
+    }
+
+    last_rapl_e, last_rapl_t = read_rapl_energy()
+    cpu_watts = None
+    live_rec_until = 0.0
+    verdict_msg = "Not run yet — press [2] for 20s CPU stress or [3] to record a game/LLM run."
+    status_msg = "Ready. Press [1] Probe Sensors, [2] 20s CPU Load Test, [3] 60s Live Peak Recorder."
+    last_poll = 0.0
+
+    while True:
+        now = time.monotonic()
+        if now - last_poll >= 1.0:
+            cpu = get_cpu_thermals()
+            gpu = get_gpu_thermals()
+            fans, nvmes = get_hwmon_fans_and_nvme()
+
+            cur_e, cur_t = read_rapl_energy()
+            if cur_e is not None and last_rapl_e is not None and cur_t > last_rapl_t and cur_e >= last_rapl_e:
+                cpu_watts = (cur_e - last_rapl_e) / (cur_t - last_rapl_t) / 1_000_000.0
+            last_rapl_e, last_rapl_t = cur_e, cur_t
+
+            active_rpms = [f["rpm"] for f in fans if f["rpm"] > 0]
+            peaks["cpu_c"] = max(peaks["cpu_c"], cpu["pkg_temp"], cpu["peak_core"])
+            peaks["gpu_c"] = max(peaks["gpu_c"], gpu["temp_c"])
+            peaks["gpu_w"] = max(peaks["gpu_w"], gpu["pwr_draw"])
+            peaks["gpu_fan"] = max(peaks["gpu_fan"], gpu["fan_pct"])
+            if active_rpms:
+                peaks["fan_rpm"] = max(peaks["fan_rpm"], max(active_rpms))
+
+            if live_rec_until > 0 and now >= live_rec_until:
+                live_rec_until = 0.0
+                if gpu["slowdown"] != "None" or peaks["gpu_c"] >= 84.0 or peaks["cpu_c"] >= 98.0:
+                    verdict_msg = f"WARN: Live peak CPU {peaks['cpu_c']:.1f}°C | GPU {peaks['gpu_c']:.0f}°C ({peaks['gpu_fan']}% fan)."
+                else:
+                    verdict_msg = f"PASS: Live peak CPU {peaks['cpu_c']:.1f}°C | GPU {peaks['gpu_c']:.0f}°C ({peaks['gpu_w']:.0f}W, {peaks['gpu_fan']}% fan)."
+                status_msg = verdict_msg
+
+            last_poll = now
+
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        c_ok = curses.color_pair(2) | curses.A_BOLD
+        c_warn = curses.color_pair(3) | curses.A_BOLD
+        c_err = curses.color_pair(4) | curses.A_BOLD
+
+        safe_addstr(stdscr, 1, 2, "razorbillOS // Thermal, Power & Fan Curve Auditor (i9-13900F + RTX 4090)", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 78, curses.color_pair(1))
+
+        # CPU Section
+        safe_addstr(stdscr, 4, 2, "[ CPU THERMALS, POWER & THROTTLING (i9-13900F) ]", c_title)
+        cpu_col = c_err if cpu["pkg_temp"] >= 95 else (c_warn if cpu["pkg_temp"] >= 82 else c_ok)
+        safe_addstr(
+            stdscr,
+            5,
+            4,
+            f"Package / Peak Core : {cpu['pkg_temp']:.1f}°C / {cpu['peak_core']:.1f}°C  (TJMax: {cpu['tjmax']:.0f}°C)",
+            cpu_col,
+        )
+        pwr_str = f"{cpu_watts:.1f} W" if cpu_watts is not None else "N/A (root RAPL)"
+        th_ok = cpu["pkg_throttle"] == 0 and cpu["core_throttle"] == 0
+        safe_addstr(
+            stdscr,
+            6,
+            4,
+            f"Package Power / Thrt: {pwr_str}  |  Throttle Events: Pkg={cpu['pkg_throttle']}, Core={cpu['core_throttle']}",
+            c_ok if th_ok else c_err,
+        )
+
+        # GPU Section
+        safe_addstr(stdscr, 8, 2, "[ NVIDIA RTX 4090 THERMALS & FAN CURVE ]", c_title)
+        gpu_col = c_err if gpu["temp_c"] >= 83 else (c_warn if gpu["temp_c"] >= 74 else c_ok)
+        safe_addstr(
+            stdscr,
+            9,
+            4,
+            f"GPU Temp & Power    : {gpu['temp_c']:.0f}°C (Target <83°C)  |  {gpu['pwr_draw']:.1f} W / {gpu['pwr_limit']:.0f} W  ({gpu['clk_gr']} MHz)",
+            gpu_col,
+        )
+        fan_state = "0-RPM Idle Mode" if gpu["fan_pct"] == 0 and gpu["temp_c"] < 55 else f"Active ({gpu['fan_pct']}%)"
+        sd_ok = gpu["slowdown"] == "None"
+        safe_addstr(
+            stdscr,
+            10,
+            4,
+            f"GPU Fan & Slowdown  : {fan_state}  |  Thermal Slowdown: {gpu['slowdown']}",
+            c_ok if sd_ok else c_err,
+        )
+
+        # System Fans & NVMe
+        safe_addstr(stdscr, 12, 2, "[ SYSTEM / MOTHERBOARD FANS & NVME SENSORS (HWMON) ]", c_title)
+        y = 13
+        if not fans:
+            safe_addstr(
+                stdscr,
+                y,
+                4,
+                "No motherboard PWM fan sensors exposed yet — press [1] to run sensors-detect.",
+                c_warn,
+            )
+            y += 1
+        else:
+            for f in fans[:5]:
+                rpm_col = c_ok if f["rpm"] > 0 else c_warn
+                safe_addstr(
+                    stdscr,
+                    y,
+                    4,
+                    f"{f['label']:<14} ({f['chip']:<10}): {f['rpm']:>4} RPM  [{f['mode']}]",
+                    rpm_col,
+                )
+                y += 1
+
+        if nvmes:
+            nv_str = "  |  ".join(f"{n['label']}: {n['temp_c']:.1f}°C" for n in nvmes[:3])
+            safe_addstr(stdscr, y, 4, f"NVMe Storage        : {nv_str}")
+            y += 1
+
+        # Peak Recorder
+        y += 1
+        safe_addstr(stdscr, y, 2, "[ LOAD TEST & SESSION PEAK RECORDER ]", c_title)
+        y += 1
+        rec_tag = f" [RECORDING: {int(live_rec_until - now)}s left]" if live_rec_until > now else ""
+        safe_addstr(
+            stdscr,
+            y,
+            4,
+            f"Session Peaks{rec_tag}: CPU {peaks['cpu_c']:.1f}°C | GPU {peaks['gpu_c']:.0f}°C ({peaks['gpu_w']:.0f}W, {peaks['gpu_fan']}% fan) | Max Fan {peaks['fan_rpm']} RPM",
+            c_warn if rec_tag else c_ok,
+        )
+        y += 1
+        v_col = c_err if verdict_msg.startswith("WARN") else (c_ok if verdict_msg.startswith("PASS") else 0)
+        safe_addstr(stdscr, y, 4, f"Last Verdict        : {verdict_msg}", v_col)
+
+        # Actions
+        y += 2
+        safe_addstr(stdscr, y, 2, "[ ACTIONS ]", c_title)
+        safe_addstr(stdscr, y + 1, 4, "[1] Install lm_sensors + stress-ng & Probe Motherboard Fan Sensors")
+        safe_addstr(stdscr, y + 2, 4, "[2] Run 20s Multi-Core CPU Thermal & Fan Curve Stress Test")
+        safe_addstr(stdscr, y + 3, 4, "[3] Start 60s Live Load Peak Recorder (Launch Game / Local LLM Now)")
+        safe_addstr(stdscr, y + 4, 4, "[4] Reset Session Peaks   [r] Refresh   [q] Quit")
+
+        safe_addstr(stdscr, y + 6, 2, "-" * 78, curses.color_pair(1))
+        msg_col = c_err if status_msg.startswith(("ERROR", "WARN")) else (c_ok if status_msg.startswith(("OK", "PASS")) else c_warn)
+        safe_addstr(stdscr, y + 7, 2, f"Status: {status_msg}", msg_col)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        elif ch in (ord("q"), ord("Q")):
+            break
+        elif ch == ord("1"):
+            status_msg = action_probe_sensors(stdscr)
+            last_poll = 0.0
+        elif ch == ord("2"):
+            verdict_msg = action_cpu_load_test(stdscr, peaks)
+            status_msg = verdict_msg
+            last_poll = 0.0
+        elif ch == ord("3"):
+            live_rec_until = time.monotonic() + 60.0
+            status_msg = "RECORDING 60s: Launch a game or local LLM now to capture peak GPU/CPU/fan curves."
+        elif ch == ord("4"):
+            peaks = {
+                "cpu_c": max(cpu["pkg_temp"], cpu["peak_core"]),
+                "gpu_c": gpu["temp_c"],
+                "gpu_w": gpu["pwr_draw"],
+                "gpu_fan": gpu["fan_pct"],
+                "fan_rpm": max(active_rpms) if active_rpms else 0,
+            }
+            status_msg = "OK: Session peak counters reset to current live readings."
+        elif ch in (ord("r"), ord("R")):
+            last_poll = 0.0
+            status_msg = "Refreshed thermal and fan sensors."
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

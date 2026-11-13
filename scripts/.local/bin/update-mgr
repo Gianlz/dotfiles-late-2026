@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+import curses
+import os
+import shutil
+import subprocess
+import time
+
+
+def run_cmd(args: list[str], timeout: int = 15) -> tuple[int, str, str]:
+    try:
+        res = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def get_system_versions() -> dict:
+    running_k = os.uname().release
+    modules_present = os.path.isdir(f"/usr/lib/modules/{running_k}")
+
+    _, k_pkgs, _ = run_cmd(["bash", "-c", "pacman -Q | grep -E '^linux(-cachyos|-zen|-lts|-hardened)? '"])
+    installed_k = ", ".join(k_pkgs.splitlines()) if k_pkgs else "Unknown"
+
+    _, nv_pkgs, _ = run_cmd(["bash", "-c", "pacman -Q | grep -E '^(nvidia-utils|linux-cachyos-nvidia-open|nvidia-open-dkms|nvidia-dkms) '"])
+    nvidia_ver = ", ".join(nv_pkgs.splitlines()) if nv_pkgs else "None"
+
+    _, hypr_out, _ = run_cmd(["pacman", "-Q", "hyprland"])
+    hypr_ver = hypr_out if hypr_out else "N/A"
+
+    _, boot_pkgs, _ = run_cmd(["bash", "-c", "pacman -Q | grep -E '^(limine|limine-snapper-sync|limine-mkinitcpio-hook|grub|efibootmgr) '"])
+    boot_ver = ", ".join(boot_pkgs.splitlines()) if boot_pkgs else "systemd-boot / EFI"
+
+    return {
+        "running_k": running_k,
+        "modules_present": modules_present,
+        "installed_k": installed_k,
+        "nvidia_ver": nvidia_ver,
+        "hypr_ver": hypr_ver,
+        "boot_ver": boot_ver,
+    }
+
+
+def get_update_and_health_audit() -> dict:
+    aur_helper = "paru" if shutil.which("paru") else ("yay" if shutil.which("yay") else "none")
+
+    repo_updates = []
+    if shutil.which("checkupdates"):
+        rc, out, _ = run_cmd(["checkupdates"], timeout=25)
+        if rc == 0 and out:
+            repo_updates = [l.strip() for l in out.splitlines() if l.strip()]
+    else:
+        rc, out, _ = run_cmd(["pacman", "-Qu"], timeout=10)
+        if rc == 0 and out:
+            repo_updates = [l.strip() for l in out.splitlines() if l.strip()]
+
+    aur_updates = []
+    if aur_helper != "none":
+        rc_a, out_a, _ = run_cmd([aur_helper, "-Qua"], timeout=20)
+        if rc_a == 0 and out_a:
+            aur_updates = [l.strip() for l in out_a.splitlines() if l.strip()]
+
+    _, pacnew_out, _ = run_cmd(["bash", "-c", "find /etc -name '*.pacnew' -o -name '*.pacsave' 2>/dev/null"])
+    pacnew_files = [l.strip() for l in pacnew_out.splitlines() if l.strip()]
+
+    _, sys_fail, _ = run_cmd(["systemctl", "--failed", "--no-legend", "--plain"])
+    _, usr_fail, _ = run_cmd(["systemctl", "--user", "--failed", "--no-legend", "--plain"])
+    failed_units = [l.split()[0] for l in (sys_fail + "\n" + usr_fail).splitlines() if l.strip()]
+
+    _, orph_out, _ = run_cmd(["pacman", "-Qtdq"])
+    orphans = [l.strip() for l in orph_out.splitlines() if l.strip()]
+
+    _, fs_out, _ = run_cmd(["findmnt", "-n", "-o", "FSTYPE", "/"])
+    root_fs = fs_out.strip() or "unknown"
+
+    return {
+        "aur_helper": aur_helper,
+        "has_checkupdates": bool(shutil.which("checkupdates")),
+        "repo_updates": repo_updates,
+        "aur_updates": aur_updates,
+        "pacnew_files": pacnew_files,
+        "failed_units": failed_units,
+        "orphans": orphans,
+        "root_fs": root_fs,
+    }
+
+
+def run_interactive_cmd(stdscr, cmd: list[str], banner: str, pause_after: bool = True) -> int:
+    curses.def_prog_mode()
+    curses.endwin()
+    print(f"\n[update-mgr] {banner}\n")
+    proc = subprocess.run(cmd)
+    if pause_after:
+        input("\n[update-mgr] Command finished (exit code {}). Press Enter to return to TUI...".format(proc.returncode))
+    curses.reset_prog_mode()
+    stdscr.refresh()
+    return proc.returncode
+
+
+def action_full_update(stdscr, aur_helper: str) -> str:
+    if aur_helper in ("paru", "yay"):
+        cmd = [aur_helper, "-Syu"]
+        banner = f"Running full system + AUR update via {aur_helper} -Syu..."
+    else:
+        cmd = ["sudo", "pacman", "-Syu"]
+        banner = "Running full system update via sudo pacman -Syu..."
+
+    rc = run_interactive_cmd(stdscr, cmd, banner, pause_after=True)
+    if rc != 0:
+        return f"ERROR: System update exited with code {rc}. Review terminal output before rebooting."
+    return "PASS: Full system update completed cleanly. Press [4] to reboot into updated kernel/drivers."
+
+
+def action_check_pacnew_and_services(stdscr) -> str:
+    script = (
+        "echo '=== .pacnew / .pacsave files in /etc ==='; "
+        "find /etc -name '*.pacnew' -o -name '*.pacsave' 2>/dev/null || true; "
+        "echo -e '\n=== Failed System Units ==='; "
+        "systemctl --failed --no-pager; "
+        "echo -e '\n=== Failed User Units ==='; "
+        "systemctl --user --failed --no-pager"
+    )
+    run_interactive_cmd(stdscr, ["bash", "-c", script], "Inspecting .pacnew files and failed systemd units...", pause_after=True)
+    return "OK: Completed .pacnew and systemd unit inspection."
+
+
+def action_sync_boot_and_initramfs(stdscr) -> str:
+    if shutil.which("limine-mkinitcpio"):
+        cmd = ["sudo", "limine-mkinitcpio"]
+        banner = "Rebuilding initramfs & syncing Limine bootloader entries (limine-mkinitcpio)..."
+    else:
+        cmd = ["sudo", "mkinitcpio", "-P"]
+        banner = "Rebuilding all initramfs presets (mkinitcpio -P)..."
+
+    rc = run_interactive_cmd(stdscr, cmd, banner, pause_after=True)
+    if rc != 0:
+        return f"ERROR: Initramfs/bootloader sync failed (exit code {rc})."
+    return "PASS: Initramfs & bootloader entries rebuilt cleanly."
+
+
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    try:
+        win.addstr(y, x, text[: max_x - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def main(stdscr) -> None:
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_RED, -1)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)
+
+    status_msg = "Scanning repositories and system state..."
+    sys_v = get_system_versions()
+    audit = get_update_and_health_audit()
+    status_msg = "Ready. Press [1] Full System Update, [3] Sync Boot/Initramfs, [4] Reboot System."
+    confirm_reboot = False
+
+    def refresh_all() -> None:
+        nonlocal sys_v, audit
+        sys_v = get_system_versions()
+        audit = get_update_and_health_audit()
+
+    while True:
+        stdscr.erase()
+        c_title = curses.color_pair(1) | curses.A_BOLD
+        c_ok = curses.color_pair(2) | curses.A_BOLD
+        c_warn = curses.color_pair(3) | curses.A_BOLD
+        c_err = curses.color_pair(4) | curses.A_BOLD
+
+        safe_addstr(stdscr, 1, 2, "razorbillOS // Full System Update & Reboot Manager (CachyOS)", c_title)
+        safe_addstr(stdscr, 2, 2, "=" * 78, curses.color_pair(1))
+
+        # Section 1: Kernel & Core Stack
+        safe_addstr(stdscr, 4, 2, "[ KERNEL, GPU DRIVER & BOOTLOADER ]", c_title)
+        k_state = "Aligned" if sys_v["modules_present"] else "REBOOT REQUIRED (Kernel upgraded on disk)"
+        safe_addstr(
+            stdscr,
+            5,
+            4,
+            f"Running Kernel    : {sys_v['running_k']}  [{k_state}]",
+            c_ok if sys_v["modules_present"] else c_warn,
+        )
+        safe_addstr(stdscr, 6, 4, f"Installed Kernel  : {sys_v['installed_k']}")
+        safe_addstr(stdscr, 7, 4, f"NVIDIA Stack      : {sys_v['nvidia_ver']}")
+        safe_addstr(stdscr, 8, 4, f"Compositor / Boot : {sys_v['hypr_ver']}  |  {sys_v['boot_ver']}")
+
+        # Section 2: Pending Updates & Health
+        safe_addstr(stdscr, 10, 2, "[ PENDING UPDATES & PRE-REBOOT AUDIT ]", c_title)
+        repo_cnt = len(audit["repo_updates"])
+        aur_cnt = len(audit["aur_updates"])
+        sync_note = "" if audit["has_checkupdates"] else " (install pacman-contrib for live sync check)"
+        safe_addstr(
+            stdscr,
+            11,
+            4,
+            f"Official Repo Pkgs: {repo_cnt} pending{sync_note}",
+            c_ok if repo_cnt == 0 else c_warn,
+        )
+        safe_addstr(
+            stdscr,
+            12,
+            4,
+            f"AUR Helper / Pkgs : {audit['aur_helper']} ({aur_cnt} pending)",
+            c_ok if aur_cnt == 0 else c_warn,
+        )
+        if audit["repo_updates"]:
+            preview = ", ".join(p.split()[0] for p in audit["repo_updates"][:6])
+            if repo_cnt > 6:
+                preview += f" (+{repo_cnt - 6} more)"
+            safe_addstr(stdscr, 13, 4, f"Update Preview    : {preview}", c_warn)
+        else:
+            safe_addstr(stdscr, 13, 4, f"Root Filesystem   : {audit['root_fs']} (Snapper pre/post hooks active if configured)")
+
+        pac_cnt = len(audit["pacnew_files"])
+        fail_cnt = len(audit["failed_units"])
+        safe_addstr(
+            stdscr,
+            14,
+            4,
+            f"Config / Services : {pac_cnt} .pacnew/.pacsave files  |  {fail_cnt} failed systemd units  |  {len(audit['orphans'])} orphans",
+            c_ok if (pac_cnt == 0 and fail_cnt == 0) else c_warn,
+        )
+
+        # Section 3: Actions
+        safe_addstr(stdscr, 16, 2, "[ ACTIONS ]", c_title)
+        safe_addstr(stdscr, 17, 4, "[1] Run Full System Update (pacman -Syu / AUR helper)")
+        safe_addstr(stdscr, 18, 4, "[2] Inspect .pacnew Config Files & Failed Systemd Units")
+        safe_addstr(stdscr, 19, 4, "[3] Rebuild Initramfs & Sync Bootloader (limine-mkinitcpio / mkinitcpio -P)")
+        safe_addstr(stdscr, 20, 4, "[4] Reboot System Now   [r] Rescan Updates   [q] Quit")
+
+        safe_addstr(stdscr, 22, 2, "-" * 78, curses.color_pair(1))
+        if confirm_reboot:
+            safe_addstr(
+                stdscr,
+                23,
+                2,
+                "CONFIRM REBOOT: Press [y] now to execute 'systemctl reboot' (any other key cancels).",
+                c_err,
+            )
+        else:
+            msg_col = (
+                c_err
+                if status_msg.startswith("ERROR")
+                else (c_ok if status_msg.startswith(("OK", "PASS")) else c_warn)
+            )
+            safe_addstr(stdscr, 23, 2, f"Status: {status_msg}", msg_col)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+
+        if confirm_reboot:
+            if ch in (ord("y"), ord("Y")):
+                curses.endwin()
+                subprocess.run(["systemctl", "reboot"])
+                return
+            else:
+                confirm_reboot = False
+                status_msg = "Reboot cancelled."
+                continue
+
+        if ch in (ord("q"), ord("Q")):
+            break
+        elif ch == ord("1"):
+            status_msg = action_full_update(stdscr, audit["aur_helper"])
+            refresh_all()
+        elif ch == ord("2"):
+            status_msg = action_check_pacnew_and_services(stdscr)
+            refresh_all()
+        elif ch == ord("3"):
+            status_msg = action_sync_boot_and_initramfs(stdscr)
+            refresh_all()
+        elif ch == ord("4"):
+            confirm_reboot = True
+        elif ch in (ord("r"), ord("R")):
+            status_msg = "Rescanning repositories..."
+            stdscr.refresh()
+            refresh_all()
+            status_msg = "Refreshed package, kernel, and service status."
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
